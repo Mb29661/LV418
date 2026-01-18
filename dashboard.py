@@ -65,6 +65,8 @@ ALL_PARAMS = [
     "app_heartbeat", "O15", "O17",
     "D12", "D14", "D15", "T38",
     "SG Status", "SG01",
+    # Numeric codes for power/energy
+    "2054",  # Electrical power (kW)
     # Curve points (AT compensation)
     "CP1-1", "CP1-2", "CP1-3", "CP1-4", "CP1-5", "CP1-6", "CP1-7",
     # Zone 2
@@ -399,8 +401,8 @@ def log_reading(params):
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Calculate COP - T53 = power (kW), T39 = flow (m³/h)
-        t53 = float(params.get('T53', 0) or 0)  # Electrical power kW
+        # Calculate COP - 2054 = power (kW), T39 = flow (m³/h)
+        power_kw = float(params.get('2054', 0) or 0)  # 2054 = Electrical power kW
         t39 = float(params.get('T39', 0) or 0)  # Flow rate m³/h
         t02 = float(params.get('T02', 0) or 0)
         t01 = float(params.get('T01', 0) or 0)
@@ -408,7 +410,7 @@ def log_reading(params):
         delta_t = t02 - t01
         flow_lmin = t39 * 1000 / 60  # m³/h to l/min
         heat_power = (flow_lmin * delta_t * 4.186) / 60 if flow_lmin > 0 else 0
-        cop = min(heat_power / t53, 5.0) if t53 > 0.1 else None  # Max COP 5.0
+        cop = min(heat_power / power_kw, 5.0) if power_kw > 0.1 else None  # Max COP 5.0
 
         timestamp = datetime.now().replace(minute=0, second=0, microsecond=0)
 
@@ -437,7 +439,7 @@ def log_reading(params):
                 float(params.get('T06', 0) or 0),
                 float(params.get('T12', 0) or 0),
                 float(params.get('T33', 0) or 0),
-                t53,  # Power kW (stored in t39_power_kw column)
+                power_kw,  # Power kW (stored in t39_power_kw column)
                 t39,  # Flow m³/h (stored in d12_flow_rate column)
                 cop,
                 heat_power,
@@ -456,7 +458,7 @@ def log_reading(params):
                 float(params.get('T06', 0) or 0),
                 float(params.get('T12', 0) or 0),
                 float(params.get('T33', 0) or 0),
-                t53,  # Power kW (stored in t39_power_kw column)
+                power_kw,  # Power kW (stored in t39_power_kw column)
                 t39,  # Flow m³/h (stored in d12_flow_rate column)
                 cop,
                 heat_power,
@@ -739,6 +741,458 @@ MESSAGE_TEMPLATE = """
 
 # ============== End Auth Templates ==============
 
+SETTINGS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Inställningar - Perifal LV-418</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 15px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        h1 { font-size: 1.5em; }
+        .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+        .badge {
+            padding: 5px 12px;
+            border-radius: 15px;
+            font-size: 0.8em;
+            font-weight: 500;
+        }
+        .card {
+            background: rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 15px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+            margin-bottom: 15px;
+        }
+        .card h2 {
+            font-size: 1em;
+            margin-bottom: 12px;
+            color: #90caf9;
+        }
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px;
+        }
+        .control-item {
+            background: rgba(0,0,0,0.2);
+            padding: 10px;
+            border-radius: 8px;
+        }
+        .control-item label {
+            display: block;
+            font-size: 0.75em;
+            color: #90caf9;
+            margin-bottom: 5px;
+        }
+        .control-row {
+            display: flex;
+            gap: 8px;
+        }
+        .control-row input, .control-row select {
+            flex: 1;
+            padding: 8px;
+            border-radius: 5px;
+            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(0,0,0,0.3);
+            color: #fff;
+            font-size: 0.9em;
+        }
+        .control-row button {
+            padding: 8px 15px;
+            border-radius: 5px;
+            border: none;
+            background: #4caf50;
+            color: white;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+        .control-row button:hover { background: #45a049; }
+        .toggle {
+            padding: 8px 20px;
+            border-radius: 5px;
+            border: none;
+            font-weight: bold;
+            cursor: pointer;
+            width: 100%;
+        }
+        .toggle.active { background: #4caf50; color: white; }
+        .toggle.inactive { background: #546e7a; color: white; }
+        .message {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 12px 20px;
+            border-radius: 8px;
+            background: #4caf50;
+            color: white;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .message.show { opacity: 1; }
+        .message.error { background: #ff5252; }
+        .debug-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85em;
+        }
+        .debug-table th, .debug-table td {
+            padding: 8px 12px;
+            border: 1px solid rgba(255,255,255,0.1);
+            text-align: left;
+        }
+        .debug-table th {
+            background: rgba(0,0,0,0.3);
+            color: #90caf9;
+        }
+        .debug-table tr:nth-child(even) {
+            background: rgba(0,0,0,0.15);
+        }
+        .debug-table td:first-child {
+            font-family: monospace;
+            color: #ffca28;
+        }
+        .search-box {
+            padding: 10px;
+            border-radius: 5px;
+            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(0,0,0,0.3);
+            color: #fff;
+            width: 100%;
+            margin-bottom: 15px;
+        }
+        .status-info {
+            font-size: 0.8em;
+            color: #888;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>⚙️ Inställningar - Perifal LV-418</h1>
+            <div class="badges">
+                <a href="/" class="badge" style="background:#7c4dff;text-decoration:none;cursor:pointer">← DASHBOARD</a>
+            </div>
+        </header>
+
+        <!-- Controls -->
+        <div class="card">
+            <h2>🎛️ Styrning</h2>
+            <p style="font-size:0.75em;color:#ff8a80;margin-bottom:15px;">⚠️ Kräver lösenord. Ändra endast om du vet vad du gör.</p>
+
+            <h3 style="font-size:0.85em;color:#90caf9;margin:12px 0 10px 0;">Grundinställningar</h3>
+            <div class="controls">
+                <div class="control-item">
+                    <label>Kurva offset</label>
+                    <div class="control-row">
+                        <input type="number" id="inputCurveOffset" step="0.5" min="15" max="60">
+                        <button onclick="safeSetParam('compensate_offset', document.getElementById('inputCurveOffset').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>Kurva lutning</label>
+                    <div class="control-row">
+                        <input type="number" id="inputCurveSlope" step="0.1" min="0" max="3.5">
+                        <button onclick="safeSetParam('compensate_slope', document.getElementById('inputCurveSlope').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>VV börvärde</label>
+                    <div class="control-row">
+                        <input type="number" id="inputHwTarget" step="1" min="30" max="58">
+                        <button onclick="safeSetParam('R01', document.getElementById('inputHwTarget').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>Tyst läge</label>
+                    <button id="silentBtn" class="toggle inactive" onclick="safeToggleSilent()">AV</button>
+                </div>
+            </div>
+
+            <h3 style="font-size:0.85em;color:#90caf9;margin:20px 0 10px 0;">Avancerat</h3>
+            <div class="controls">
+                <div class="control-item">
+                    <label>Värme börvärde (M1)</label>
+                    <div class="control-row">
+                        <input type="number" id="inputM1HeatTarget" step="1" min="15" max="60">
+                        <button onclick="safeSetParam('M1 Heating Target', document.getElementById('inputM1HeatTarget').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>Max effekt %</label>
+                    <div class="control-row">
+                        <input type="number" id="inputMaxPower" step="5" min="0" max="100">
+                        <button onclick="safeSetParam('M1 Max. Power', document.getElementById('inputMaxPower').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>Pump PÅ/AV</label>
+                    <button id="powerBtn" class="toggle active" onclick="safeTogglePower()">PÅ</button>
+                </div>
+                <div class="control-item">
+                    <label>SG Ready läge</label>
+                    <div class="control-row">
+                        <select id="inputSG">
+                            <option value="0">Av</option>
+                            <option value="1">Normal</option>
+                            <option value="2">Lågt elpris</option>
+                            <option value="3">Överskott</option>
+                        </select>
+                        <button onclick="safeSetParam('SG Status', document.getElementById('inputSG').value)">OK</button>
+                    </div>
+                </div>
+            </div>
+
+            <h3 style="font-size:0.85em;color:#90caf9;margin:20px 0 10px 0;">Värmekurva (kurvpunkter)</h3>
+            <div class="controls">
+                <div class="control-item">
+                    <label>CP1-1 (-20°C)</label>
+                    <div class="control-row">
+                        <input type="number" id="inputCP1_1" step="1">
+                        <button onclick="safeSetParam('CP1-1', document.getElementById('inputCP1_1').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>CP1-2 (-10°C)</label>
+                    <div class="control-row">
+                        <input type="number" id="inputCP1_2" step="1">
+                        <button onclick="safeSetParam('CP1-2', document.getElementById('inputCP1_2').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>CP1-3 (0°C)</label>
+                    <div class="control-row">
+                        <input type="number" id="inputCP1_3" step="1">
+                        <button onclick="safeSetParam('CP1-3', document.getElementById('inputCP1_3').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>CP1-4 (5°C)</label>
+                    <div class="control-row">
+                        <input type="number" id="inputCP1_4" step="1">
+                        <button onclick="safeSetParam('CP1-4', document.getElementById('inputCP1_4').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>CP1-5 (10°C)</label>
+                    <div class="control-row">
+                        <input type="number" id="inputCP1_5" step="1">
+                        <button onclick="safeSetParam('CP1-5', document.getElementById('inputCP1_5').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>CP1-6 (15°C)</label>
+                    <div class="control-row">
+                        <input type="number" id="inputCP1_6" step="1">
+                        <button onclick="safeSetParam('CP1-6', document.getElementById('inputCP1_6').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>CP1-7 (20°C)</label>
+                    <div class="control-row">
+                        <input type="number" id="inputCP1_7" step="1">
+                        <button onclick="safeSetParam('CP1-7', document.getElementById('inputCP1_7').value)">OK</button>
+                    </div>
+                </div>
+            </div>
+
+            <h3 style="font-size:0.85em;color:#90caf9;margin:20px 0 10px 0;">Zone 2</h3>
+            <div class="controls">
+                <div class="control-item">
+                    <label>Zone 2 Offset</label>
+                    <div class="control-row">
+                        <input type="number" id="inputZ2Offset" step="0.5">
+                        <button onclick="safeSetParam('Zone 2 Curve Offset', document.getElementById('inputZ2Offset').value)">OK</button>
+                    </div>
+                </div>
+                <div class="control-item">
+                    <label>Zone 2 Slope</label>
+                    <div class="control-row">
+                        <input type="number" id="inputZ2Slope" step="0.1">
+                        <button onclick="safeSetParam('Zone 2 Cure Slope', document.getElementById('inputZ2Slope').value)">OK</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Debug Parameters -->
+        <div class="card">
+            <h2>🔧 Debug - Alla parametrar</h2>
+            <input type="text" class="search-box" id="paramSearch" placeholder="Sök parameter..." oninput="filterParams()">
+            <div style="max-height:500px;overflow-y:auto;">
+                <table class="debug-table">
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Värde</th>
+                        </tr>
+                    </thead>
+                    <tbody id="paramTableBody">
+                        <tr><td colspan="2">Laddar...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="status-info">
+                Senast uppdaterad: <span id="lastUpdate">--</span>
+            </div>
+        </div>
+    </div>
+
+    <div id="message" class="message"></div>
+
+    <script>
+        const CONTROL_PASSWORD = 'Mb29661';
+        let passwordVerified = false;
+        let passwordTimeout = null;
+        let silentMode = false;
+        let pumpPower = true;
+        let allParams = {};
+
+        function showMessage(text, isError = false) {
+            const msg = document.getElementById('message');
+            msg.textContent = text;
+            msg.className = 'message show' + (isError ? ' error' : '');
+            setTimeout(() => msg.className = 'message', 3000);
+        }
+
+        function verifyPassword() {
+            const pwd = prompt('⚠️ VARNING: Du är på väg att ändra pumpen.\\n\\nAnge lösenord för att bekräfta:');
+            if (pwd === CONTROL_PASSWORD) {
+                passwordVerified = true;
+                if (passwordTimeout) clearTimeout(passwordTimeout);
+                passwordTimeout = setTimeout(() => { passwordVerified = false; }, 5 * 60 * 1000);
+                return true;
+            } else if (pwd !== null) {
+                showMessage('Fel lösenord!', true);
+            }
+            return false;
+        }
+
+        async function safeSetParam(code, value) {
+            if (!passwordVerified && !verifyPassword()) return;
+            await setParam(code, value);
+        }
+
+        function safeToggleSilent() {
+            if (!passwordVerified && !verifyPassword()) return;
+            setParam('hanControl', silentMode ? '0000000000000000' : '0000000000000010');
+        }
+
+        function safeTogglePower() {
+            if (!passwordVerified && !verifyPassword()) return;
+            const newState = pumpPower ? '0' : '1';
+            if (!pumpPower || confirm('Är du säker på att du vill STÄNGA AV pumpen?')) {
+                setParam('Power', newState);
+            }
+        }
+
+        async function setParam(code, value) {
+            try {
+                const res = await fetch('/api/control', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({code, value: String(value)})
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showMessage('Sparat: ' + code + ' = ' + value);
+                    fetchStatus();
+                } else {
+                    showMessage('Fel', true);
+                }
+            } catch (e) {
+                showMessage('Anslutningsfel', true);
+            }
+        }
+
+        function filterParams() {
+            const search = document.getElementById('paramSearch').value.toLowerCase();
+            const rows = document.querySelectorAll('#paramTableBody tr');
+            rows.forEach(row => {
+                const text = row.textContent.toLowerCase();
+                row.style.display = text.includes(search) ? '' : 'none';
+            });
+        }
+
+        async function fetchStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                allParams = data;
+
+                // Update controls with current values
+                document.getElementById('inputCurveOffset').value = data.compensate_offset || '';
+                document.getElementById('inputCurveSlope').value = data.compensate_slope || '';
+                document.getElementById('inputHwTarget').value = data.R01 || '';
+                document.getElementById('inputM1HeatTarget').value = data['M1 Heating Target'] || '';
+                document.getElementById('inputMaxPower').value = data['M1 Max. Power'] || '';
+                document.getElementById('inputCP1_1').value = data['CP1-1'] || '';
+                document.getElementById('inputCP1_2').value = data['CP1-2'] || '';
+                document.getElementById('inputCP1_3').value = data['CP1-3'] || '';
+                document.getElementById('inputCP1_4').value = data['CP1-4'] || '';
+                document.getElementById('inputCP1_5').value = data['CP1-5'] || '';
+                document.getElementById('inputCP1_6').value = data['CP1-6'] || '';
+                document.getElementById('inputCP1_7').value = data['CP1-7'] || '';
+                document.getElementById('inputZ2Offset').value = data['Zone 2 Curve Offset'] || '';
+                document.getElementById('inputZ2Slope').value = data['Zone 2 Cure Slope'] || '';
+                document.getElementById('inputSG').value = data['SG Status'] || '0';
+
+                // Silent mode
+                silentMode = data.hanControl === '0000000000000010';
+                const silentBtn = document.getElementById('silentBtn');
+                silentBtn.textContent = silentMode ? 'PÅ' : 'AV';
+                silentBtn.className = 'toggle ' + (silentMode ? 'active' : 'inactive');
+
+                // Power state
+                pumpPower = data.Power === '1';
+                const powerBtn = document.getElementById('powerBtn');
+                powerBtn.textContent = pumpPower ? 'PÅ' : 'AV';
+                powerBtn.className = 'toggle ' + (pumpPower ? 'active' : 'inactive');
+
+                // Debug table
+                const tbody = document.getElementById('paramTableBody');
+                const sortedKeys = Object.keys(data).sort();
+                tbody.innerHTML = sortedKeys.map(key =>
+                    `<tr><td>${key}</td><td>${data[key]}</td></tr>`
+                ).join('');
+
+                document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+
+                // Re-apply filter
+                filterParams();
+            } catch (e) {
+                console.error('Fetch error:', e);
+            }
+        }
+
+        // Initial load and refresh every 30 seconds
+        fetchStatus();
+        setInterval(fetchStatus, 30000);
+    </script>
+</body>
+</html>
+"""
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="sv">
@@ -994,6 +1448,7 @@ HTML_TEMPLATE = """
                 <span id="compBadge" class="badge compressor" style="display:none">KOMPRESSOR</span>
                 <span id="woodBadge" class="badge wood" style="display:none">VEDELDNING</span>
                 <span id="silentBadge" class="badge silent" style="display:none">TYST</span>
+                <a href="/settings" target="_blank" class="badge" style="background:#7c4dff;text-decoration:none;cursor:pointer">INSTÄLLNINGAR</a>
                 <a href="/logout" class="badge" style="background:#546e7a;text-decoration:none;cursor:pointer">LOGGA UT</a>
             </div>
         </header>
@@ -1074,131 +1529,11 @@ HTML_TEMPLATE = """
                 <div class="stats" style="grid-template-columns: 1fr; margin-top: 10px;">
                     <div class="stat-item" style="background: rgba(141, 110, 99, 0.3);">
                         <div class="stat-value" style="color:#8d6e63;"><span id="woodHours">--</span> / <span id="woodSessions">--</span></div>
-                        <div class="stat-label">🪵 Eldning senaste 72h (timmar / tillfällen)</div>
+                        <div class="stat-label">🪵 Eldning senaste 7 dygn (timmar / tillfällen)</div>
                     </div>
                 </div>
             </div>
 
-            <!-- AT Compensation Curve -->
-            <div class="card">
-                <h2>📉 Värmekurva (AT-kompensation)</h2>
-                <div class="chart-container" style="height:200px;">
-                    <canvas id="curveChart"></canvas>
-                </div>
-                <div style="font-size:0.75em;color:#888;margin-top:8px;text-align:center;">
-                    Visar måltemperatur (framledning) vid olika utomhustemperaturer
-                    <br><span id="curveInfo">--</span>
-                </div>
-            </div>
-
-            <!-- Controls (collapsed by default) -->
-            <div class="card">
-                <h2 onclick="toggleControls()" style="cursor:pointer;">
-                    ⚙️ Styrning <span id="controlsArrow" style="font-size:0.8em;">▶</span>
-                    <span style="color:#ff8a80;font-size:0.65em;margin-left:10px;">⚠️ Kräver lösenord</span>
-                </h2>
-                <div id="controlsPanel" style="display:none;">
-                    <p style="font-size:0.75em;color:#888;margin-bottom:12px;">Ändra endast om du vet vad du gör. Felaktiga värden kan skada systemet.</p>
-
-                    <h3 style="font-size:0.8em;color:#90caf9;margin:12px 0 8px 0;">Grundinställningar</h3>
-                    <div class="controls">
-                        <div class="control-item">
-                            <label>Kurva offset</label>
-                            <div class="control-row">
-                                <input type="number" id="inputCurveOffset" step="0.5" min="15" max="60">
-                                <button onclick="safeSetParam('compensate_offset', document.getElementById('inputCurveOffset').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>Kurva lutning</label>
-                            <div class="control-row">
-                                <input type="number" id="inputCurveSlope" step="0.1" min="0" max="3.5">
-                                <button onclick="safeSetParam('compensate_slope', document.getElementById('inputCurveSlope').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>VV börvärde</label>
-                            <div class="control-row">
-                                <input type="number" id="inputHwTarget" step="1" min="30" max="58">
-                                <button onclick="safeSetParam('R01', document.getElementById('inputHwTarget').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>Tyst läge</label>
-                            <button id="silentBtn" class="toggle inactive" onclick="safeToggleSilent()">AV</button>
-                        </div>
-                    </div>
-
-                    <h3 style="font-size:0.8em;color:#90caf9;margin:16px 0 8px 0;">Avancerat</h3>
-                    <div class="controls">
-                        <div class="control-item">
-                            <label>Värme börvärde (M1)</label>
-                            <div class="control-row">
-                                <input type="number" id="inputM1HeatTarget" step="1" min="15" max="60">
-                                <button onclick="safeSetParam('M1 Heating Target', document.getElementById('inputM1HeatTarget').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>Max effekt %</label>
-                            <div class="control-row">
-                                <input type="number" id="inputMaxPower" step="5" min="0" max="100">
-                                <button onclick="safeSetParam('M1 Max. Power', document.getElementById('inputMaxPower').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>Pump PÅ/AV</label>
-                            <button id="powerBtn" class="toggle active" onclick="safeTogglePower()">PÅ</button>
-                        </div>
-                        <div class="control-item">
-                            <label>Kurvpunkt 1 (CP1-1)</label>
-                            <div class="control-row">
-                                <input type="number" id="inputCP1_1" step="1">
-                                <button onclick="safeSetParam('CP1-1', document.getElementById('inputCP1_1').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>Kurvpunkt 2 (CP1-2)</label>
-                            <div class="control-row">
-                                <input type="number" id="inputCP1_2" step="1">
-                                <button onclick="safeSetParam('CP1-2', document.getElementById('inputCP1_2').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>Kurvpunkt 3 (CP1-3)</label>
-                            <div class="control-row">
-                                <input type="number" id="inputCP1_3" step="1">
-                                <button onclick="safeSetParam('CP1-3', document.getElementById('inputCP1_3').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>Zone 2 Offset</label>
-                            <div class="control-row">
-                                <input type="number" id="inputZ2Offset" step="0.5">
-                                <button onclick="safeSetParam('Zone 2 Curve Offset', document.getElementById('inputZ2Offset').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>Zone 2 Slope</label>
-                            <div class="control-row">
-                                <input type="number" id="inputZ2Slope" step="0.1">
-                                <button onclick="safeSetParam('Zone 2 Cure Slope', document.getElementById('inputZ2Slope').value)">OK</button>
-                            </div>
-                        </div>
-                        <div class="control-item">
-                            <label>SG Ready läge</label>
-                            <div class="control-row">
-                                <select id="inputSG">
-                                    <option value="0">Av</option>
-                                    <option value="1">Normal</option>
-                                    <option value="2">Lågt elpris</option>
-                                    <option value="3">Överskott</option>
-                                </select>
-                                <button onclick="safeSetParam('SG Status', document.getElementById('inputSG').value)">OK</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
         </div>
 
         <!-- Historical Chart -->
@@ -1275,7 +1610,6 @@ HTML_TEMPLATE = """
         let pumpPower = true;
         let chart = null;
         let energyChart = null;
-        let curveChart = null;
 
         function showMessage(text, isError = false) {
             const msg = document.getElementById('message');
@@ -1285,7 +1619,7 @@ HTML_TEMPLATE = """
         }
 
         function calculateCOP(data) {
-            const powerIn = parseFloat(data.T53) || 0;  // T53 = Electrical power (kW)
+            const powerIn = parseFloat(data['2054']) || 0;  // 2054 = Electrical power (kW)
             const flowTemp = parseFloat(data.T02) || 0;
             const returnTemp = parseFloat(data.T01) || 0;
             const deltaT = flowTemp - returnTemp;
@@ -1416,53 +1750,24 @@ HTML_TEMPLATE = """
 
                 if (data.readings && data.readings.length > 0) {
                     const source = data.source === 'cloud' ? 'Moln' : 'Databas';
+                    document.getElementById('dbStatus').textContent = source + ': ' + data.readings.length + ' mätpunkter';
 
-                    // Detect wood heating periods (tank temp > flow temp)
+                    // Detect wood heating periods for chart (same time span as other data)
+                    const WOOD_THRESHOLD = 7;
                     let woodHeatingPeriods = [];
-                    let woodHeatingHours = 0;
-                    let woodHeatingSessions = 0;
-                    let prevWoodHeatingInWindow = null;  // Track state only within 72h window
-
-                    // Use all available data for stats (72h from cloud)
-                    const now = new Date();
-                    const last72h = new Date(now - 72 * 60 * 60 * 1000);
-
-                    const WOOD_THRESHOLD = 7;  // Tank must be 7°C warmer than flow
                     data.readings.forEach(r => {
                         const tankTemp = r.t06;
                         const flowTemp = r.t02_flow;
                         const timestamp = new Date(r.timestamp);
-                        // Wood heating detected when tank is significantly warmer than flow
                         const isWoodHeating = tankTemp !== null && flowTemp !== null && tankTemp > flowTemp + WOOD_THRESHOLD;
-
-                        // Always add to chart visualization
                         if (isWoodHeating) {
                             woodHeatingPeriods.push({x: timestamp, y: tankTemp});
                         } else {
                             woodHeatingPeriods.push({x: timestamp, y: null});
                         }
-
-                        // Only count stats for last 72h
-                        if (timestamp >= last72h) {
-                            if (isWoodHeating) {
-                                woodHeatingHours++;
-                                // Count new session if transitioning from non-heating to heating
-                                // (only within the 72h window)
-                                if (prevWoodHeatingInWindow === false) {
-                                    woodHeatingSessions++;
-                                } else if (prevWoodHeatingInWindow === null) {
-                                    // First reading in window that is wood heating = first session
-                                    woodHeatingSessions++;
-                                }
-                            }
-                            prevWoodHeatingInWindow = isWoodHeating;
-                        }
                     });
 
-                    // Note: Wood stats display is updated by loadWoodStats() which always uses 72h
-                    document.getElementById('dbStatus').textContent = source + ': ' + data.readings.length + ' mätpunkter';
-
-                    // Filter out null values for cleaner charts
+                    // Update chart datasets
                     chart.data.datasets[0].data = data.readings
                         .filter(r => r.t02_flow !== null)
                         .map(r => ({x: new Date(r.timestamp), y: r.t02_flow}));
@@ -1481,8 +1786,6 @@ HTML_TEMPLATE = """
                     chart.data.datasets[5].data = data.readings
                         .filter(r => r.t39_power_kw !== null)
                         .map(r => ({x: new Date(r.timestamp), y: r.t39_power_kw}));
-
-                    // Wood heating visualization - show as filled area where tank > flow
                     chart.data.datasets[6].data = woodHeatingPeriods;
 
                     chart.update();
@@ -1529,23 +1832,18 @@ HTML_TEMPLATE = """
                 const t02 = parseFloat(data.T02) || 0;
                 const t01 = parseFloat(data.T01) || 0;
                 const t11 = parseFloat(data.T11) || 0;
-                const t06 = parseFloat(data.T06) || 0;
+                const t08 = parseFloat(data.T08) || 0;  // Tank temp
                 const t03 = parseFloat(data.T03) || 0;
-                const t53 = parseFloat(data.T53) || 0;  // Power kW
+                const powerKW = parseFloat(data['2054']) || 0;  // 2054 = Electrical power kW
                 const t33 = parseFloat(data.T33) || 0;
                 const heatTarget = parseFloat(data['M1 Heating Target']) || 0;
 
                 document.getElementById('tempOutdoor').textContent = t04.toFixed(1) + '°';
                 document.getElementById('tempFlow').textContent = t02.toFixed(1) + '°';
                 document.getElementById('tempIngåenden').textContent = t01.toFixed(1) + '°';
-                document.getElementById('tempTank').textContent = t06.toFixed(1) + '°';
+                document.getElementById('tempTank').textContent = t08.toFixed(1) + '°';
                 document.getElementById('tempComp').textContent = (parseFloat(data.T12) || 0).toFixed(1) + '°';
                 document.getElementById('tempEvap').textContent = t03.toFixed(1) + '°';
-
-                // Settings
-                document.getElementById('inputCurveOffset').value = data.compensate_offset;
-                document.getElementById('inputCurveSlope').value = data.compensate_slope;
-                document.getElementById('inputHwTarget').value = data.R01;
 
                 // Driftdata - interpolate target from curve points
                 const outdoorTemps = [-20, -10, 0, 5, 10, 15, 20];
@@ -1575,9 +1873,6 @@ HTML_TEMPLATE = """
 
                 document.getElementById('calcTarget').textContent = calcTarget.toFixed(1) + '°C';
 
-                // Update curve chart
-                updateCurveChart(data);
-
                 // COP
                 const copData = calculateCOP(data);
                 document.getElementById('copValue').textContent = copData.cop > 0 ? copData.cop.toFixed(2) : '--';
@@ -1588,7 +1883,7 @@ HTML_TEMPLATE = """
 
                 // Pump active status
                 const pumpActiveEl = document.getElementById('pumpActive');
-                if (t33 > 5 || t53 > 0.2) {
+                if (t33 > 5 || powerKW > 0.2) {
                     pumpActiveEl.textContent = 'AKTIV';
                     pumpActiveEl.style.color = '#4caf50';
                 } else {
@@ -1603,20 +1898,20 @@ HTML_TEMPLATE = """
                 const woodBadge = document.getElementById('woodBadge');
                 const compBadge = document.getElementById('compBadge');
 
-                const compRunning = t53 > 0.2 || t33 > 10;
-                const tankAboveTarget = t06 > heatTarget || t01 > heatTarget;
+                const compRunning = powerKW > 0.2 || t33 > 10;
+                const tankAboveTarget = t08 > heatTarget || t01 > heatTarget;
 
                 if (!compRunning && tankAboveTarget) {
                     // Wood heating detected - tank temp above target
                     pumpStatus.className = 'pump-status wood';
                     statusTitle.textContent = '🪵 Vedeldning detekterad';
-                    statusDesc.textContent = 'Tank: ' + t06.toFixed(1) + '°C > Börvärde: ' + heatTarget.toFixed(0) + '°C - Pumpen vilar';
+                    statusDesc.textContent = 'Tank: ' + t08.toFixed(1) + '°C > Börvärde: ' + heatTarget.toFixed(0) + '°C - Pumpen vilar';
                     woodBadge.style.display = 'inline-block';
                     compBadge.style.display = 'none';
                 } else if (compRunning) {
                     pumpStatus.className = 'pump-status running';
                     statusTitle.textContent = '🟢 Värmepump aktiv';
-                    statusDesc.textContent = 'Kompressor: ' + t33.toFixed(0) + '% | Effekt: ' + t53.toFixed(2) + ' kW';
+                    statusDesc.textContent = 'Kompressor: ' + t33.toFixed(0) + '% | Effekt: ' + powerKW.toFixed(2) + ' kW';
                     woodBadge.style.display = 'none';
                     compBadge.style.display = 'inline-block';
                 } else {
@@ -1633,26 +1928,12 @@ HTML_TEMPLATE = """
                 modeBadge.textContent = mode === '1' ? 'VÄRME' : mode === '2' ? 'KYLA' : mode === '3' ? 'VV' : 'LÄGE ' + mode;
                 modeBadge.className = 'badge ' + (mode === '1' ? 'heating' : mode === '3' ? 'hotwater' : 'idle');
 
-                // Silent mode
+                // Silent mode badge
                 silentMode = data.hanControl && data.hanControl.includes('1');
-                document.getElementById('silentBtn').textContent = silentMode ? 'PÅ' : 'AV';
-                document.getElementById('silentBtn').className = 'toggle ' + (silentMode ? 'active' : 'inactive');
                 document.getElementById('silentBadge').style.display = silentMode ? 'inline-block' : 'none';
 
                 // Power state
                 pumpPower = data.Power === '1';
-                document.getElementById('powerBtn').textContent = pumpPower ? 'PÅ' : 'AV';
-                document.getElementById('powerBtn').className = 'toggle ' + (pumpPower ? 'active' : 'inactive');
-
-                // Advanced controls - populate with current values
-                if (data['M1 Heating Target']) document.getElementById('inputM1HeatTarget').value = data['M1 Heating Target'];
-                if (data['M1 Max. Power']) document.getElementById('inputMaxPower').value = data['M1 Max. Power'];
-                if (data['CP1-1']) document.getElementById('inputCP1_1').value = data['CP1-1'];
-                if (data['CP1-2']) document.getElementById('inputCP1_2').value = data['CP1-2'];
-                if (data['CP1-3']) document.getElementById('inputCP1_3').value = data['CP1-3'];
-                if (data['Zone 2 Curve Offset']) document.getElementById('inputZ2Offset').value = data['Zone 2 Curve Offset'];
-                if (data['Zone 2 Cure Slope']) document.getElementById('inputZ2Slope').value = data['Zone 2 Cure Slope'];
-                if (data['SG Status']) document.getElementById('inputSG').value = data['SG Status'];
 
                 document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('sv-SE');
 
@@ -1732,94 +2013,6 @@ HTML_TEMPLATE = """
             }
         }
 
-        function initCurveChart() {
-            const ctx = document.getElementById('curveChart').getContext('2d');
-            curveChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    datasets: [
-                        {
-                            label: 'Värmekurva',
-                            data: [],
-                            borderColor: '#ff7043',
-                            backgroundColor: 'rgba(255, 112, 67, 0.1)',
-                            borderWidth: 2,
-                            pointRadius: 4,
-                            pointBackgroundColor: '#ff7043',
-                            fill: true,
-                            tension: 0.3
-                        },
-                        {
-                            label: 'Nu',
-                            data: [],
-                            borderColor: '#4caf50',
-                            borderWidth: 0,
-                            pointRadius: 8,
-                            pointBackgroundColor: '#4caf50',
-                            pointStyle: 'circle'
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { display: false },
-                        tooltip: {
-                            callbacks: {
-                                label: ctx => 'Utgående: ' + ctx.parsed.y + '°C vid ' + ctx.parsed.x + '°C ute'
-                            }
-                        }
-                    },
-                    scales: {
-                        x: {
-                            type: 'linear',
-                            title: { display: true, text: 'Utomhustemp °C', color: '#666', font: { size: 10 } },
-                            ticks: { color: '#666' },
-                            grid: { color: 'rgba(255,255,255,0.05)' },
-                            reverse: true
-                        },
-                        y: {
-                            title: { display: true, text: 'Utgående °C', color: '#666', font: { size: 10 } },
-                            ticks: { color: '#666' },
-                            grid: { color: 'rgba(255,255,255,0.05)' }
-                        }
-                    }
-                }
-            });
-        }
-
-        function updateCurveChart(data) {
-            // CP1-1 to CP1-7 define curve points at outdoor temps (typically -20 to +20)
-            // Standard outdoor temp points: -20, -10, 0, 5, 10, 15, 20
-            const outdoorTemps = [-20, -10, 0, 5, 10, 15, 20];
-            const curvePoints = [];
-
-            for (let i = 1; i <= 7; i++) {
-                const val = parseFloat(data['CP1-' + i]);
-                if (!isNaN(val) && val > 0) {
-                    curvePoints.push({ x: outdoorTemps[i - 1], y: val });
-                }
-            }
-
-            if (curvePoints.length > 0) {
-                curveChart.data.datasets[0].data = curvePoints;
-
-                // Add current position marker
-                const currentOutdoor = parseFloat(data.T04) || 0;
-                const currentFlow = parseFloat(data.T02) || 0;
-                curveChart.data.datasets[1].data = [{ x: currentOutdoor, y: currentFlow }];
-
-                curveChart.update();
-
-                // Update curve info
-                const offset = data.compensate_offset || '--';
-                const slope = data.compensate_slope || '--';
-                document.getElementById('curveInfo').textContent =
-                    'Offset: ' + offset + '°C | Lutning: ' + slope + ' | Aktuell: ' + currentFlow.toFixed(1) + '°C vid ' + currentOutdoor.toFixed(1) + '°C ute';
-            }
-        }
-
         function initEnergyChart() {
             const ctx = document.getElementById('energyChart').getContext('2d');
             energyChart = new Chart(ctx, {
@@ -1862,7 +2055,7 @@ HTML_TEMPLATE = """
                 const res = await fetch('/api/energy?hours=72');
                 const data = await res.json();
 
-                // Update stats regardless of readings
+                // Update stats
                 document.getElementById('energyToday').textContent = (data.today_kwh || 0).toFixed(1);
                 document.getElementById('energy24h').textContent = (data.last_24h_kwh || 0).toFixed(1);
                 document.getElementById('energy7d').textContent = (data.total_kwh || 0).toFixed(1);
@@ -1892,10 +2085,10 @@ HTML_TEMPLATE = """
             }
         }
 
-        // Load wood heating stats (72h - max available from cloud)
+        // Load wood heating stats (7 days / 168h)
         async function loadWoodStats() {
             try {
-                const res = await fetch('/api/history?hours=72');
+                const res = await fetch('/api/history?hours=168');
                 const data = await res.json();
                 if (data.readings && data.readings.length > 0) {
                     let woodHeatingHours = 0;
@@ -1927,7 +2120,6 @@ HTML_TEMPLATE = """
 
         // Initialize
         initChart();
-        initCurveChart();
         initEnergyChart();
         fetchStatus();
         loadHistory();
@@ -2102,6 +2294,11 @@ def api_import_cloud():
 @login_required
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+@app.route('/settings')
+@login_required
+def settings():
+    return render_template_string(SETTINGS_TEMPLATE)
 
 @app.route('/api/status')
 def api_status():
