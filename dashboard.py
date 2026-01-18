@@ -1990,21 +1990,10 @@ HTML_TEMPLATE = """
                 data: {
                     datasets: [
                         { label: 'Utgående', data: [], borderColor: '#ef5350', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
-                        { label: 'Ingående', data: [], borderColor: '#ff7043', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
                         { label: 'Utomhus', data: [], borderColor: '#64b5f6', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
                         { label: 'Tank', data: [], borderColor: '#ce93d8', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
                         { label: 'COP', data: [], borderColor: '#4caf50', borderWidth: 2, pointRadius: 0, tension: 0.3, yAxisID: 'cop' },
-                        { label: 'El kW', data: [], borderColor: '#ffca28', borderWidth: 1.5, pointRadius: 0, tension: 0.3, yAxisID: 'power' },
-                        {
-                            label: '🪵 Vedeldning',
-                            data: [],
-                            borderColor: '#8d6e63',
-                            backgroundColor: 'rgba(141, 110, 99, 0.3)',
-                            borderWidth: 0,
-                            pointRadius: 0,
-                            fill: true,
-                            tension: 0.3
-                        }
+                        { label: 'El kW', data: [], borderColor: '#ffca28', borderWidth: 1.5, pointRadius: 0, tension: 0.3, yAxisID: 'power' }
                     ]
                 },
                 options: {
@@ -2102,41 +2091,22 @@ HTML_TEMPLATE = """
                     const source = data.source === 'cloud' ? 'Moln' : 'Databas';
                     document.getElementById('dbStatus').textContent = source + ': ' + data.readings.length + ' mätpunkter';
 
-                    // Detect wood heating periods for chart (same time span as other data)
-                    const WOOD_THRESHOLD = 7;
-                    let woodHeatingPeriods = [];
-                    data.readings.forEach(r => {
-                        const tankTemp = r.t06;
-                        const flowTemp = r.t02_flow;
-                        const timestamp = new Date(r.timestamp);
-                        const isWoodHeating = tankTemp !== null && flowTemp !== null && tankTemp > flowTemp + WOOD_THRESHOLD;
-                        if (isWoodHeating) {
-                            woodHeatingPeriods.push({x: timestamp, y: tankTemp});
-                        } else {
-                            woodHeatingPeriods.push({x: timestamp, y: null});
-                        }
-                    });
-
                     // Update chart datasets
                     chart.data.datasets[0].data = data.readings
                         .filter(r => r.t02_flow !== null)
                         .map(r => ({x: new Date(r.timestamp), y: r.t02_flow}));
                     chart.data.datasets[1].data = data.readings
-                        .filter(r => r.t01_return !== null)
-                        .map(r => ({x: new Date(r.timestamp), y: r.t01_return}));
-                    chart.data.datasets[2].data = data.readings
                         .filter(r => r.t04_outdoor !== null)
                         .map(r => ({x: new Date(r.timestamp), y: r.t04_outdoor}));
-                    chart.data.datasets[3].data = data.readings
+                    chart.data.datasets[2].data = data.readings
                         .filter(r => r.t06 !== null)
                         .map(r => ({x: new Date(r.timestamp), y: r.t06}));
-                    chart.data.datasets[4].data = data.readings
+                    chart.data.datasets[3].data = data.readings
                         .filter(r => r.cop_calculated !== null && r.cop_calculated <= 5.0)
                         .map(r => ({x: new Date(r.timestamp), y: Math.min(r.cop_calculated, 5.0)}));
-                    chart.data.datasets[5].data = data.readings
+                    chart.data.datasets[4].data = data.readings
                         .filter(r => r.t39_power_kw !== null)
                         .map(r => ({x: new Date(r.timestamp), y: r.t39_power_kw}));
-                    chart.data.datasets[6].data = woodHeatingPeriods;
 
                     chart.update();
                 } else {
@@ -2152,20 +2122,16 @@ HTML_TEMPLATE = """
             const mode = document.getElementById('chartDataset').value;
             if (mode === 'temps') {
                 chart.data.datasets[0].hidden = false;  // Utgående
-                chart.data.datasets[1].hidden = false;  // Ingående
-                chart.data.datasets[2].hidden = false;  // Utomhus
-                chart.data.datasets[3].hidden = false;  // Tank
-                chart.data.datasets[4].hidden = true;   // COP
-                chart.data.datasets[5].hidden = true;   // El kW
-                chart.data.datasets[6].hidden = false;  // Vedeldning
+                chart.data.datasets[1].hidden = false;  // Utomhus
+                chart.data.datasets[2].hidden = false;  // Tank
+                chart.data.datasets[3].hidden = true;   // COP
+                chart.data.datasets[4].hidden = true;   // El kW
             } else if (mode === 'cop') {
                 chart.data.datasets[0].hidden = true;
                 chart.data.datasets[1].hidden = true;
                 chart.data.datasets[2].hidden = true;
-                chart.data.datasets[3].hidden = true;
+                chart.data.datasets[3].hidden = false;
                 chart.data.datasets[4].hidden = false;
-                chart.data.datasets[5].hidden = false;
-                chart.data.datasets[6].hidden = true;
             } else {
                 chart.data.datasets.forEach(ds => ds.hidden = false);
             }
