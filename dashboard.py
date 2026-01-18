@@ -2109,16 +2109,16 @@ HTML_TEMPLATE = """
                         y1: {
                             position: 'right',
                             suggestedMin: -10,
+                            afterBuildTicks: function(axis) {
+                                // Force ticks at 0,4,8,12,16,20 only
+                                axis.ticks = [0, 4, 8, 12, 16, 20].map(v => ({value: v}));
+                            },
                             ticks: {
                                 color: '#ffca28',
-                                callback: function(val) {
-                                    // Only show labels at 0,4,8,12,16,20 as 0,1,2,3,4,5
-                                    if ([0, 4, 8, 12, 16, 20].includes(val)) return val / 4;
-                                    return null;
-                                }
+                                callback: val => val / 4
                             },
                             grid: { drawOnChartArea: false },
-                            title: { display: true, text: 'kW / COP', color: '#ffca28' }
+                            title: { display: false }
                         }
                     }
                 }
