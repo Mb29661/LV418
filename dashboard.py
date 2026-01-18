@@ -1083,14 +1083,6 @@ HTML_TEMPLATE = """
                         <div class="stat-value" id="compFreqStat">--</div>
                         <div class="stat-label">Kompressor %</div>
                     </div>
-                    <div class="stat-item">
-                        <div class="stat-value" id="pressure1">--</div>
-                        <div class="stat-label">Tryck HP</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="stat-value" id="pressure2">--</div>
-                        <div class="stat-label">Tryck LP</div>
-                    </div>
                 </div>
                 <div class="stats" style="grid-template-columns: 1fr; margin-top: 10px;">
                     <div class="stat-item" style="background: rgba(141, 110, 99, 0.3);">
@@ -1607,9 +1599,7 @@ HTML_TEMPLATE = """
                 document.getElementById('deltaT').textContent = copData.deltaT.toFixed(1);
                 document.getElementById('compFreq').textContent = t33.toFixed(0);
 
-                // Pressure and flow
-                document.getElementById('pressure1').textContent = (data.T35 || '--') + ' bar';
-                document.getElementById('pressure2').textContent = (data.T36 || '--') + ' bar';
+                // Flow and compressor
                 document.getElementById('flowRate').textContent = (data.D12 || '--');
                 document.getElementById('compFreqStat').textContent = t33.toFixed(0) + '%';
 
