@@ -2633,18 +2633,10 @@ def settings():
 
 @app.route('/api/status')
 def api_status():
-    # Try to get data from local database first
-    db_params = get_latest_readings()
-
-    if db_params and len(db_params) > 5:
-        # We have enough data in DB, use it but augment with source info
-        db_params['_source'] = 'database'
-        return jsonify(db_params)
-
-    # Fallback to cloud API if DB is empty
+    # Always use cloud API for live status (polled every 10 sec by frontend)
+    # Database is only for historical data
     client = get_client()
     params = client.get_all_parameters(DEVICE_CODE, ALL_PARAMS)
-    params['_source'] = 'cloud'
     return jsonify(params)
 
 @app.route('/api/wood-heating')
