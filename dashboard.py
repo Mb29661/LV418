@@ -2045,8 +2045,8 @@ HTML_TEMPLATE = """
                         { label: 'Utgående', data: [], borderColor: '#ef5350', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
                         { label: 'Utomhus', data: [], borderColor: '#64b5f6', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
                         { label: 'Tank', data: [], borderColor: '#ce93d8', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
-                        { label: 'COP', data: [], borderColor: '#4caf50', borderWidth: 2, pointRadius: 0, tension: 0.3, yAxisID: 'cop' },
-                        { label: 'El kW', data: [], borderColor: '#ffca28', borderWidth: 1.5, pointRadius: 0, tension: 0.3, yAxisID: 'power' }
+                        { label: 'COP (×4)', data: [], borderColor: '#4caf50', borderWidth: 2, pointRadius: 0, tension: 0.3 },
+                        { label: 'El kW (×4)', data: [], borderColor: '#ffca28', borderWidth: 1.5, pointRadius: 0, tension: 0.3 }
                     ]
                 },
                 options: {
@@ -2055,7 +2055,15 @@ HTML_TEMPLATE = """
                     interaction: { intersect: false, mode: 'index' },
                     plugins: {
                         legend: { labels: { color: '#90caf9', boxWidth: 12, font: { size: 10 } } },
-                        tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + (ctx.parsed.y?.toFixed(1) || '--') } }
+                        tooltip: { callbacks: {
+                            label: ctx => {
+                                let val = ctx.parsed.y;
+                                // Unscale COP and power for display
+                                if (ctx.datasetIndex === 3) return 'COP: ' + (val / 4).toFixed(2);
+                                if (ctx.datasetIndex === 4) return 'El: ' + (val / 4).toFixed(1) + ' kW';
+                                return ctx.dataset.label + ': ' + (val?.toFixed(1) || '--') + '°C';
+                            }
+                        }}
                     },
                     scales: {
                         x: {
@@ -2096,20 +2104,6 @@ HTML_TEMPLATE = """
                             grid: { color: 'rgba(255,255,255,0.05)' },
                             title: { display: true, text: '°C', color: '#666' }
                         },
-                        cop: {
-                            position: 'right',
-                            ticks: { color: '#4caf50' },
-                            grid: { display: false },
-                            title: { display: true, text: 'COP', color: '#4caf50' },
-                            min: 0, max: 8
-                        },
-                        power: {
-                            position: 'right',
-                            ticks: { color: '#ffca28' },
-                            grid: { display: false },
-                            title: { display: true, text: 'kW', color: '#ffca28' },
-                            min: 0
-                        }
                     }
                 }
             });
@@ -2154,12 +2148,13 @@ HTML_TEMPLATE = """
                     chart.data.datasets[2].data = data.readings
                         .filter(r => r.t06 !== null)
                         .map(r => ({x: new Date(r.timestamp), y: r.t06}));
+                    // Scale COP and power by 4 to fit under 20 on temp axis
                     chart.data.datasets[3].data = data.readings
                         .filter(r => r.cop_calculated !== null && r.cop_calculated <= 5.0)
-                        .map(r => ({x: new Date(r.timestamp), y: Math.min(r.cop_calculated, 5.0)}));
+                        .map(r => ({x: new Date(r.timestamp), y: Math.min(r.cop_calculated, 5.0) * 4}));
                     chart.data.datasets[4].data = data.readings
                         .filter(r => r.t39_power_kw !== null)
-                        .map(r => ({x: new Date(r.timestamp), y: r.t39_power_kw}));
+                        .map(r => ({x: new Date(r.timestamp), y: r.t39_power_kw * 4}));
 
                     chart.update();
                 } else {
