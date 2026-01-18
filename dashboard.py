@@ -154,6 +154,30 @@ def init_db():
             )
         ''')
 
+    # New table for raw parameter storage (all parameters with original names)
+    if USE_POSTGRES:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS readings_raw (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP NOT NULL,
+                parameter VARCHAR(50) NOT NULL,
+                value REAL,
+                UNIQUE(timestamp, parameter)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_readings_raw_param ON readings_raw(parameter, timestamp)')
+    else:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS readings_raw (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                parameter TEXT NOT NULL,
+                value REAL,
+                UNIQUE(timestamp, parameter)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_readings_raw_param ON readings_raw(parameter, timestamp)')
+
     conn.commit()
     conn.close()
     print("Database initialized", flush=True)
@@ -395,9 +419,54 @@ def import_cloud_history():
         print(f"Cloud import error: {e}", flush=True)
         return 0
 
-def log_reading(params):
-    """Log a reading to the database"""
+def log_reading_raw(params, timestamp=None):
+    """Log ALL parameters to readings_raw table with original names"""
     try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if timestamp is None:
+            timestamp = datetime.now()
+
+        # Round to nearest 10 minutes for consistent intervals
+        minute = (timestamp.minute // 10) * 10
+        timestamp = timestamp.replace(minute=minute, second=0, microsecond=0)
+
+        count = 0
+        for param, value in params.items():
+            # Try to convert to float, skip non-numeric values
+            try:
+                numeric_value = float(value) if value is not None and value != '' else None
+            except (ValueError, TypeError):
+                continue  # Skip non-numeric parameters like Mode, etc.
+
+            if numeric_value is not None:
+                if USE_POSTGRES:
+                    cur.execute('''
+                        INSERT INTO readings_raw (timestamp, parameter, value)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (timestamp, parameter) DO UPDATE SET value = EXCLUDED.value
+                    ''', (timestamp, param, numeric_value))
+                else:
+                    cur.execute('''
+                        INSERT OR REPLACE INTO readings_raw (timestamp, parameter, value)
+                        VALUES (?, ?, ?)
+                    ''', (timestamp.isoformat(), param, numeric_value))
+                count += 1
+
+        conn.commit()
+        conn.close()
+        return count
+    except Exception as e:
+        print(f"Error logging raw reading: {e}", flush=True)
+        return 0
+
+def log_reading(params):
+    """Log a reading to the database (both old format and new raw format)"""
+    try:
+        # Log to new raw table with all parameters
+        raw_count = log_reading_raw(params)
+
         conn = get_db_connection()
         cur = conn.cursor()
 
@@ -471,6 +540,287 @@ def log_reading(params):
     except Exception as e:
         print(f"Error logging reading: {e}", flush=True)
         return False
+
+def get_latest_readings():
+    """Get latest values for all parameters from readings_raw"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Get the latest value for each parameter
+        if USE_POSTGRES:
+            cur.execute('''
+                SELECT DISTINCT ON (parameter) parameter, value, timestamp
+                FROM readings_raw
+                ORDER BY parameter, timestamp DESC
+            ''')
+        else:
+            cur.execute('''
+                SELECT parameter, value, timestamp
+                FROM readings_raw
+                WHERE (parameter, timestamp) IN (
+                    SELECT parameter, MAX(timestamp)
+                    FROM readings_raw
+                    GROUP BY parameter
+                )
+            ''')
+
+        rows = cur.fetchall()
+        conn.close()
+
+        # Convert to dict with parameter names as keys
+        result = {}
+        for row in rows:
+            result[row[0]] = row[1]
+
+        return result
+    except Exception as e:
+        print(f"Error getting latest readings: {e}", flush=True)
+        return {}
+
+def get_history_from_db(parameters, hours=168):
+    """Get historical data from readings_raw for specified parameters"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if USE_POSTGRES:
+            placeholders = ','.join(['%s'] * len(parameters))
+            cur.execute(f'''
+                SELECT timestamp, parameter, value
+                FROM readings_raw
+                WHERE parameter IN ({placeholders})
+                AND timestamp > NOW() - INTERVAL '%s hours'
+                ORDER BY timestamp ASC
+            ''', (*parameters, hours))
+        else:
+            placeholders = ','.join(['?'] * len(parameters))
+            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+            cur.execute(f'''
+                SELECT timestamp, parameter, value
+                FROM readings_raw
+                WHERE parameter IN ({placeholders})
+                AND timestamp > ?
+                ORDER BY timestamp ASC
+            ''', (*parameters, cutoff))
+
+        rows = cur.fetchall()
+        conn.close()
+
+        # Organize by timestamp
+        by_time = {}
+        for row in rows:
+            ts = row[0] if isinstance(row[0], str) else row[0].isoformat()
+            if ts not in by_time:
+                by_time[ts] = {}
+            by_time[ts][row[1]] = row[2]
+
+        # Convert to list of readings
+        readings = []
+        for ts in sorted(by_time.keys()):
+            reading = {'timestamp': ts}
+            reading.update(by_time[ts])
+            readings.append(reading)
+
+        return readings
+    except Exception as e:
+        print(f"Error getting history from DB: {e}", flush=True)
+        return []
+
+def detect_wood_heating(hours=168, threshold_temp=5, threshold_minutes=20, target_override=None):
+    """
+    Detect wood heating sessions from database.
+    Wood heating = Tank temp (T08) > Dynamic target (based on outdoor temp) + threshold_temp
+    Dynamic target = compensate_offset - (compensate_slope × outdoor_temp)
+    Returns: dict with total_hours and sessions
+    """
+    try:
+        # Get AT curve parameters for dynamic target calculation
+        latest = get_latest_readings()
+        offset = float(latest.get('compensate_offset') or 38)
+        slope = float(latest.get('compensate_slope') or 1.0)
+
+        # Get T08 (tank) and T04 (outdoor) readings from database
+        readings = get_history_from_db(['T08', 'T04'], hours)
+
+        if not readings:
+            return {'total_hours': 0, 'sessions': 0, 'periods': [], 'offset': offset, 'slope': slope}
+
+        sessions = []
+        current_session = None
+        last_outdoor = 0  # Fallback outdoor temp
+
+        for reading in readings:
+            tank_temp = reading.get('T08')
+            outdoor_temp = reading.get('T04')
+
+            if outdoor_temp is not None:
+                last_outdoor = outdoor_temp
+            else:
+                outdoor_temp = last_outdoor
+
+            if tank_temp is None:
+                continue
+
+            timestamp = reading['timestamp']
+            if isinstance(timestamp, str):
+                ts = datetime.fromisoformat(timestamp.replace('Z', '+00:00').replace('+00:00', ''))
+            else:
+                ts = timestamp
+
+            # Calculate dynamic target based on outdoor temperature
+            # target = offset - (slope × outdoor_temp)
+            if target_override:
+                dynamic_target = float(target_override)
+            else:
+                dynamic_target = offset - (slope * outdoor_temp)
+
+            threshold = dynamic_target + threshold_temp
+
+            # Check if tank temp exceeds dynamic target + threshold
+            is_heating = tank_temp > threshold
+
+            if is_heating:
+                if current_session is None:
+                    current_session = {
+                        'start': ts,
+                        'end': ts,
+                        'max_temp': tank_temp,
+                        'target_at_start': round(dynamic_target, 1)
+                    }
+                else:
+                    current_session['end'] = ts
+                    current_session['max_temp'] = max(current_session['max_temp'], tank_temp)
+            else:
+                if current_session is not None:
+                    # Check if session was long enough
+                    duration = (current_session['end'] - current_session['start']).total_seconds() / 60
+                    if duration >= threshold_minutes:
+                        sessions.append(current_session)
+                    current_session = None
+
+        # Handle ongoing session
+        if current_session is not None:
+            duration = (current_session['end'] - current_session['start']).total_seconds() / 60
+            if duration >= threshold_minutes:
+                sessions.append(current_session)
+
+        # Calculate total hours
+        total_minutes = sum(
+            (s['end'] - s['start']).total_seconds() / 60
+            for s in sessions
+        )
+        total_hours = total_minutes / 60
+
+        # Format periods for display
+        periods = [
+            {
+                'start': s['start'].isoformat(),
+                'end': s['end'].isoformat(),
+                'hours': round((s['end'] - s['start']).total_seconds() / 3600, 1),
+                'max_temp': round(s.get('max_temp', 0), 1),
+                'target': s.get('target_at_start', 0)
+            }
+            for s in sessions
+        ]
+
+        return {
+            'total_hours': round(total_hours, 1),
+            'sessions': len(sessions),
+            'periods': periods,
+            'offset': offset,
+            'slope': slope,
+            'threshold_margin': threshold_temp
+        }
+    except Exception as e:
+        print(f"Error detecting wood heating: {e}", flush=True)
+        return {'total_hours': 0, 'sessions': 0, 'periods': []}
+
+def import_cloud_history(hours=72):
+    """
+    Import historical data from cloud API to populate readings_raw table.
+    Cloud API supports up to 72 hours of history.
+    """
+    try:
+        print(f"Importing {hours}h history from cloud API...", flush=True)
+
+        client = PerifalClient(USERNAME, PASSWORD)
+        if not client.login():
+            print("Failed to login to cloud API", flush=True)
+            return 0
+
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now() - timedelta(hours=min(hours, 72))).strftime('%Y-%m-%d %H:%M:%S')
+
+        # Cloud API history address codes and their parameter mappings
+        # These are the available history series from the Warmlink API
+        history_params = {
+            '2046': 'T02',      # Flow/Outlet temp
+            '2047': 'T08',      # Tank temp (mapped to T08 for consistency)
+            '2048': 'T04',      # Outdoor temp
+            '2054': '2054',     # Power In (kW) - keep original name
+            '2049': 'T01',      # Return temp (if available)
+            '2050': 'T12',      # Compressor temp (if available)
+        }
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        total_imported = 0
+
+        for address, param_name in history_params.items():
+            try:
+                data = client.get_history(DEVICE_CODE, address, start_time, end_time, "day")
+
+                if not isinstance(data, dict):
+                    continue
+
+                value_list = data.get('valueList', [])
+                if not value_list:
+                    continue
+
+                for point in value_list:
+                    try:
+                        dt_str = point.get('dateTime')  # Format: "YYYY-MM-DD HH"
+                        value = float(point.get('addressValue', 0))
+
+                        # Parse datetime
+                        timestamp = datetime.strptime(dt_str, '%Y-%m-%d %H')
+
+                        # Round to nearest 10 minutes (for consistency with live logging)
+                        timestamp = timestamp.replace(minute=0, second=0, microsecond=0)
+
+                        if USE_POSTGRES:
+                            cur.execute('''
+                                INSERT INTO readings_raw (timestamp, parameter, value)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (timestamp, parameter) DO UPDATE SET value = EXCLUDED.value
+                            ''', (timestamp, param_name, value))
+                        else:
+                            cur.execute('''
+                                INSERT OR REPLACE INTO readings_raw (timestamp, parameter, value)
+                                VALUES (?, ?, ?)
+                            ''', (timestamp.isoformat(), param_name, value))
+
+                        total_imported += 1
+
+                    except (ValueError, TypeError) as e:
+                        continue
+
+                print(f"  {param_name}: {len(value_list)} points", flush=True)
+
+            except Exception as e:
+                print(f"  {param_name}: Error - {e}", flush=True)
+
+        conn.commit()
+        conn.close()
+
+        print(f"Imported {total_imported} data points from cloud", flush=True)
+        return total_imported
+
+    except Exception as e:
+        print(f"Error importing cloud history: {e}", flush=True)
+        return 0
 
 def get_local_history(hours=72):
     """Get history from local database"""
@@ -2085,33 +2435,14 @@ HTML_TEMPLATE = """
             }
         }
 
-        // Load wood heating stats (7 days / 168h)
+        // Load wood heating stats from local database (7 days)
         async function loadWoodStats() {
             try {
-                const res = await fetch('/api/history?hours=168');
+                const res = await fetch('/api/wood-heating?hours=168');
                 const data = await res.json();
-                if (data.readings && data.readings.length > 0) {
-                    let woodHeatingHours = 0;
-                    let woodHeatingSessions = 0;
-                    let prevWoodHeating = null;
-
-                    const WOOD_THRESHOLD = 7;  // Tank must be 7°C warmer than flow
-                    data.readings.forEach(r => {
-                        const tankTemp = r.t06;
-                        const flowTemp = r.t02_flow;
-                        const isWoodHeating = tankTemp !== null && flowTemp !== null && tankTemp > flowTemp + WOOD_THRESHOLD;
-
-                        if (isWoodHeating) {
-                            woodHeatingHours++;
-                            if (prevWoodHeating === false || prevWoodHeating === null) {
-                                woodHeatingSessions++;
-                            }
-                        }
-                        prevWoodHeating = isWoodHeating;
-                    });
-
-                    document.getElementById('woodHours').textContent = woodHeatingHours;
-                    document.getElementById('woodSessions').textContent = woodHeatingSessions;
+                if (data) {
+                    document.getElementById('woodHours').textContent = data.total_hours || 0;
+                    document.getElementById('woodSessions').textContent = data.sessions || 0;
                 }
             } catch (e) {
                 console.error('Wood stats error:', e);
@@ -2302,19 +2633,82 @@ def settings():
 
 @app.route('/api/status')
 def api_status():
+    # Try to get data from local database first
+    db_params = get_latest_readings()
+
+    if db_params and len(db_params) > 5:
+        # We have enough data in DB, use it but augment with source info
+        db_params['_source'] = 'database'
+        return jsonify(db_params)
+
+    # Fallback to cloud API if DB is empty
     client = get_client()
     params = client.get_all_parameters(DEVICE_CODE, ALL_PARAMS)
+    params['_source'] = 'cloud'
     return jsonify(params)
+
+@app.route('/api/wood-heating')
+def api_wood_heating():
+    """Get wood heating statistics from local database"""
+    hours = request.args.get('hours', 168, type=int)  # Default 7 days
+    target = request.args.get('target', type=float)  # Optional target override
+    threshold = request.args.get('threshold', 5, type=float)  # Degrees above target
+    result = detect_wood_heating(hours=hours, target_override=target, threshold_temp=threshold)
+    return jsonify(result)
 
 @app.route('/api/history')
 def api_history():
-    """Fetch history from cloud API (no local logging needed)"""
+    """Fetch history from local database, fallback to cloud API"""
     hours = request.args.get('hours', 24, type=int)
-    date_from = request.args.get('from')
-    date_to = request.args.get('to')
+    source = request.args.get('source', 'auto')  # auto, db, cloud
 
+    # Parameters to fetch from database
+    params = ['T01', 'T02', 'T04', 'T08', 'T39', '2054']
+
+    # Try database first (unless cloud is explicitly requested)
+    if source != 'cloud':
+        db_readings = get_history_from_db(params, hours)
+        if db_readings and len(db_readings) > 3:
+            # Convert to expected format for UI
+            readings = []
+            for r in db_readings:
+                # Get values - use None if not available (not 0)
+                power_kw = r.get('2054')
+                t02 = r.get('T02')
+                t01 = r.get('T01')
+                t39 = r.get('T39')
+
+                # Only calculate COP if we have ALL required values
+                cop = None
+                if t01 is not None and t02 is not None and t39 is not None and power_kw is not None:
+                    if t39 > 0 and power_kw > 0.1:
+                        delta_t = t02 - t01
+                        flow_lmin = t39 * 1000 / 60
+                        heat_power = (flow_lmin * delta_t * 4.186) / 60
+                        cop = min(heat_power / power_kw, 5.0)
+
+                readings.append({
+                    'timestamp': r['timestamp'],
+                    't02_flow': t02,
+                    't06': r.get('T08'),  # T08 is tank temp
+                    't04_outdoor': r.get('T04'),
+                    't01_return': t01,  # Will be None for cloud-imported data
+                    'cop_calculated': cop,  # Will be None if T01/T39 missing
+                    't39_power_kw': power_kw
+                })
+
+            return jsonify({
+                'readings': readings,
+                'source': 'database',
+                'hours_requested': hours,
+                'count': len(readings)
+            })
+
+    # Fallback to cloud API
     try:
         client = get_client()
+        date_from = request.args.get('from')
+        date_to = request.args.get('to')
 
         # Calculate time range
         if date_from and date_to:
@@ -2325,7 +2719,6 @@ def api_history():
             start_time = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
 
         # Determine frequency based on time range
-        # Cloud API supports: "day" (hourly points), "week", "month", "year"
         if hours <= 72:
             frequency = "day"
         elif hours <= 168:
@@ -2334,35 +2727,26 @@ def api_history():
             frequency = "month"
 
         # Fetch all data series from cloud
-        # 2046 = Outlet/Flow temp (T02)
-        # 2047 = Tank temp (T06)
-        # 2048 = Outdoor temp (T04)
-        # 2054 = Power In (kW)
         flow_data = client.get_history(DEVICE_CODE, "2046", start_time, end_time, frequency)
         tank_data = client.get_history(DEVICE_CODE, "2047", start_time, end_time, frequency)
         outdoor_data = client.get_history(DEVICE_CODE, "2048", start_time, end_time, frequency)
         power_data = client.get_history(DEVICE_CODE, "2054", start_time, end_time, frequency)
 
-        # Combine data into unified format
         readings = []
 
-        # Get value lists
         flow_values = flow_data.get('valueList', []) if isinstance(flow_data, dict) else []
         tank_values = tank_data.get('valueList', []) if isinstance(tank_data, dict) else []
         outdoor_values = outdoor_data.get('valueList', []) if isinstance(outdoor_data, dict) else []
         power_values = power_data.get('valueList', []) if isinstance(power_data, dict) else []
 
-        # Create lookup dicts by datetime
         flow_by_time = {v['dateTime']: float(v['addressValue']) for v in flow_values}
         tank_by_time = {v['dateTime']: float(v['addressValue']) for v in tank_values}
         outdoor_by_time = {v['dateTime']: float(v['addressValue']) for v in outdoor_values}
         power_by_time = {v['dateTime']: float(v['addressValue']) for v in power_values}
 
-        # Get all unique timestamps and sort chronologically (oldest first)
         all_times = set(flow_by_time.keys()) | set(tank_by_time.keys()) | set(outdoor_by_time.keys()) | set(power_by_time.keys())
 
         for dt in sorted(all_times):
-            # Parse datetime - cloud format is "YYYY-MM-DD HH" (hourly)
             try:
                 timestamp = datetime.strptime(dt, '%Y-%m-%d %H')
             except:
@@ -2371,12 +2755,9 @@ def api_history():
             flow_temp = flow_by_time.get(dt)
             power_kw = power_by_time.get(dt)
 
-            # Calculate COP if we have flow temp and power
-            # Note: We don't have return temp from cloud, so we estimate deltaT as ~2°C
             cop = None
             if flow_temp and power_kw and power_kw > 0.1:
-                # Estimate: assume deltaT ~2°C and flow ~50 l/min
-                estimated_heat = (50 * 2 * 4.186) / 60  # ~7 kW at full flow
+                estimated_heat = (50 * 2 * 4.186) / 60
                 cop = estimated_heat / power_kw if power_kw > 0 else None
 
             readings.append({
@@ -2384,7 +2765,7 @@ def api_history():
                 't02_flow': flow_temp,
                 't06': tank_by_time.get(dt),
                 't04_outdoor': outdoor_by_time.get(dt),
-                't01_return': None,  # Not available from cloud
+                't01_return': None,
                 'cop_calculated': cop,
                 't39_power_kw': power_kw
             })
@@ -2395,10 +2776,7 @@ def api_history():
             'hours_requested': hours,
             'start_time': start_time,
             'end_time': end_time,
-            'frequency': frequency,
-            'flow_title': flow_data.get('title') if isinstance(flow_data, dict) else None,
-            'tank_title': tank_data.get('title') if isinstance(tank_data, dict) else None,
-            'outdoor_title': outdoor_data.get('title') if isinstance(outdoor_data, dict) else None
+            'frequency': frequency
         })
 
     except Exception as e:
@@ -2516,6 +2894,28 @@ def api_db_stats():
     stats = get_db_stats()
     return jsonify(stats)
 
+@app.route('/api/import-history')
+def api_import_history():
+    """Import history from cloud API to populate database"""
+    hours = request.args.get('hours', 72, type=int)
+    imported = import_cloud_history(hours)
+
+    # Get updated stats
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if USE_POSTGRES:
+        cur.execute('SELECT COUNT(*), COUNT(DISTINCT parameter) FROM readings_raw')
+    else:
+        cur.execute('SELECT COUNT(*), COUNT(DISTINCT parameter) FROM readings_raw')
+    row = cur.fetchone()
+    conn.close()
+
+    return jsonify({
+        'imported': imported,
+        'total_readings': row[0],
+        'unique_parameters': row[1]
+    })
+
 @app.route('/api/local-history')
 def api_local_history():
     """Get history from local database"""
@@ -2536,6 +2936,20 @@ start_logger()
 if __name__ == '__main__':
     db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
     stats = get_db_stats()
+
+    # Check readings_raw count and auto-import if empty
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM readings_raw')
+        raw_count = cur.fetchone()[0]
+        conn.close()
+
+        if raw_count < 100:
+            print(f"\nreadings_raw har bara {raw_count} rader - importerar 72h historik från cloud...")
+            import_cloud_history(72)
+    except Exception as e:
+        print(f"Could not check/import history: {e}", flush=True)
 
     print("\n" + "="*50)
     print("  Perifal LV-418 Advanced Dashboard")
