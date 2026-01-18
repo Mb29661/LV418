@@ -57,7 +57,7 @@ else:
 ALL_PARAMS = [
     "Power", "Mode", "ModeState",
     "T01", "T02", "T03", "T04", "T05", "T06", "T08", "T10", "T11", "T12", "T15",
-    "T33", "T34", "T35", "T36", "T37", "T38", "T39",
+    "T33", "T34", "T35", "T36", "T37", "T38", "T39", "T53",
     "R01", "M1 Hot Water Target", "M1 Heating Target",
     "compensate_offset", "compensate_slope",
     "M1 Max. Power",
@@ -399,8 +399,8 @@ def log_reading(params):
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Calculate COP - T38 = power (kW), T39 = flow (m³/h)
-        t38 = float(params.get('T38', 0) or 0)  # Electrical power kW
+        # Calculate COP - T53 = power (kW), T39 = flow (m³/h)
+        t53 = float(params.get('T53', 0) or 0)  # Electrical power kW
         t39 = float(params.get('T39', 0) or 0)  # Flow rate m³/h
         t02 = float(params.get('T02', 0) or 0)
         t01 = float(params.get('T01', 0) or 0)
@@ -408,7 +408,7 @@ def log_reading(params):
         delta_t = t02 - t01
         flow_lmin = t39 * 1000 / 60  # m³/h to l/min
         heat_power = (flow_lmin * delta_t * 4.186) / 60 if flow_lmin > 0 else 0
-        cop = min(heat_power / t38, 5.0) if t38 > 0.1 else None  # Max COP 5.0
+        cop = min(heat_power / t53, 5.0) if t53 > 0.1 else None  # Max COP 5.0
 
         timestamp = datetime.now().replace(minute=0, second=0, microsecond=0)
 
@@ -437,7 +437,7 @@ def log_reading(params):
                 float(params.get('T06', 0) or 0),
                 float(params.get('T12', 0) or 0),
                 float(params.get('T33', 0) or 0),
-                t38,  # Power kW (stored in t39_power_kw column)
+                t53,  # Power kW (stored in t39_power_kw column)
                 t39,  # Flow m³/h (stored in d12_flow_rate column)
                 cop,
                 heat_power,
@@ -456,7 +456,7 @@ def log_reading(params):
                 float(params.get('T06', 0) or 0),
                 float(params.get('T12', 0) or 0),
                 float(params.get('T33', 0) or 0),
-                t38,  # Power kW (stored in t39_power_kw column)
+                t53,  # Power kW (stored in t39_power_kw column)
                 t39,  # Flow m³/h (stored in d12_flow_rate column)
                 cop,
                 heat_power,
@@ -1285,7 +1285,7 @@ HTML_TEMPLATE = """
         }
 
         function calculateCOP(data) {
-            const powerIn = parseFloat(data.T38) || 0;  // T38 = Electrical power (kW)
+            const powerIn = parseFloat(data.T53) || 0;  // T53 = Electrical power (kW)
             const flowTemp = parseFloat(data.T02) || 0;
             const returnTemp = parseFloat(data.T01) || 0;
             const deltaT = flowTemp - returnTemp;
@@ -1531,7 +1531,7 @@ HTML_TEMPLATE = """
                 const t11 = parseFloat(data.T11) || 0;
                 const t06 = parseFloat(data.T06) || 0;
                 const t03 = parseFloat(data.T03) || 0;
-                const t38 = parseFloat(data.T38) || 0;  // Power kW
+                const t53 = parseFloat(data.T53) || 0;  // Power kW
                 const t33 = parseFloat(data.T33) || 0;
                 const heatTarget = parseFloat(data['M1 Heating Target']) || 0;
 
@@ -1588,7 +1588,7 @@ HTML_TEMPLATE = """
 
                 // Pump active status
                 const pumpActiveEl = document.getElementById('pumpActive');
-                if (t33 > 5 || t38 > 0.2) {
+                if (t33 > 5 || t53 > 0.2) {
                     pumpActiveEl.textContent = 'AKTIV';
                     pumpActiveEl.style.color = '#4caf50';
                 } else {
@@ -1603,7 +1603,7 @@ HTML_TEMPLATE = """
                 const woodBadge = document.getElementById('woodBadge');
                 const compBadge = document.getElementById('compBadge');
 
-                const compRunning = t38 > 0.2 || t33 > 10;
+                const compRunning = t53 > 0.2 || t33 > 10;
                 const tankAboveTarget = t06 > heatTarget || t01 > heatTarget;
 
                 if (!compRunning && tankAboveTarget) {
@@ -1616,7 +1616,7 @@ HTML_TEMPLATE = """
                 } else if (compRunning) {
                     pumpStatus.className = 'pump-status running';
                     statusTitle.textContent = '🟢 Värmepump aktiv';
-                    statusDesc.textContent = 'Kompressor: ' + t33.toFixed(0) + '% | Effekt: ' + t38.toFixed(2) + ' kW';
+                    statusDesc.textContent = 'Kompressor: ' + t33.toFixed(0) + '% | Effekt: ' + t53.toFixed(2) + ' kW';
                     woodBadge.style.display = 'none';
                     compBadge.style.display = 'inline-block';
                 } else {
