@@ -2101,24 +2101,30 @@ HTML_TEMPLATE = """
                         },
                         y: {
                             position: 'left',
-                            suggestedMin: -10,
+                            min: -10,
+                            max: 60,
                             ticks: { color: '#666' },
                             grid: { color: 'rgba(255,255,255,0.05)' },
                             title: { display: true, text: '°C', color: '#666' }
                         },
                         y1: {
+                            type: 'linear',
+                            display: true,
                             position: 'right',
-                            suggestedMin: -10,
-                            afterBuildTicks: function(axis) {
-                                // Force ticks at 0,4,8,12,16,20 only
-                                axis.ticks = [0, 4, 8, 12, 16, 20].map(v => ({value: v}));
-                            },
+                            min: -10,
+                            max: 60,
                             ticks: {
+                                stepSize: 4,
                                 color: '#ffca28',
-                                callback: val => val / 4
+                                callback: function(value) {
+                                    if (value >= 0 && value <= 20 && value % 4 === 0) {
+                                        return value / 4;
+                                    }
+                                    return '';
+                                }
                             },
                             grid: { drawOnChartArea: false },
-                            title: { display: false }
+                            title: { display: true, text: 'kW / COP', color: '#ffca28' }
                         }
                     }
                 }
