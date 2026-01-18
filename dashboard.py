@@ -408,7 +408,7 @@ def log_reading(params):
         delta_t = t02 - t01
         flow_lmin = d12 * 1000 / 60  # m³/h to l/min
         heat_power = (flow_lmin * delta_t * 4.186) / 60 if flow_lmin > 0 else 0
-        cop = heat_power / t39 if t39 > 0.1 else None
+        cop = min(heat_power / t39, 5.0) if t39 > 0.1 else None  # Max COP 5.0
 
         timestamp = datetime.now().replace(minute=0, second=0, microsecond=0)
 
@@ -1085,11 +1085,11 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="stat-item">
                         <div class="stat-value" id="pressure1">--</div>
-                        <div class="stat-label">Tryck LP</div>
+                        <div class="stat-label">Tryck HP</div>
                     </div>
                     <div class="stat-item">
                         <div class="stat-value" id="pressure2">--</div>
-                        <div class="stat-label">Tryck HP</div>
+                        <div class="stat-label">Tryck LP</div>
                     </div>
                 </div>
                 <div class="stats" style="grid-template-columns: 1fr; margin-top: 10px;">
@@ -1316,7 +1316,7 @@ HTML_TEMPLATE = """
             // Heat power: Q = flow (l/min) * deltaT (°C) * 4.186 (kJ/kg·K) / 60 (s/min) = kW
             const heatPower = (flowLmin * deltaT * 4.186) / 60;
             let cop = 0;
-            if (powerIn > 0.1) cop = heatPower / powerIn;
+            if (powerIn > 0.1) cop = Math.min(heatPower / powerIn, 5.0);  // Max COP 5.0
             return { cop, powerIn, heatPower, deltaT, flowLmin };
         }
 
@@ -1497,8 +1497,8 @@ HTML_TEMPLATE = """
                         .filter(r => r.t06 !== null)
                         .map(r => ({x: new Date(r.timestamp), y: r.t06}));
                     chart.data.datasets[4].data = data.readings
-                        .filter(r => r.cop_calculated !== null)
-                        .map(r => ({x: new Date(r.timestamp), y: r.cop_calculated}));
+                        .filter(r => r.cop_calculated !== null && r.cop_calculated <= 5.0)
+                        .map(r => ({x: new Date(r.timestamp), y: Math.min(r.cop_calculated, 5.0)}));
                     chart.data.datasets[5].data = data.readings
                         .filter(r => r.t39_power_kw !== null)
                         .map(r => ({x: new Date(r.timestamp), y: r.t39_power_kw}));
