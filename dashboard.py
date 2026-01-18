@@ -1032,9 +1032,9 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Temperatures -->
+            <!-- Temperatures & Stats -->
             <div class="card">
-                <h2>🌡️ Temperaturer</h2>
+                <h2>🌡️ Temperaturer & Driftdata</h2>
                 <div class="temps">
                     <div class="temp-item temp-outdoor">
                         <div class="temp-value" id="tempOutdoor">--</div>
@@ -1061,12 +1061,7 @@ HTML_TEMPLATE = """
                         <div class="temp-label">Förångare</div>
                     </div>
                 </div>
-            </div>
-
-            <!-- Stats -->
-            <div class="card">
-                <h2>📊 Driftdata</h2>
-                <div class="stats" style="grid-template-columns: repeat(3, 1fr);">
+                <div class="stats" style="grid-template-columns: repeat(2, 1fr); margin-top: 15px;">
                     <div class="stat-item">
                         <div class="stat-value" id="pumpActive" style="color:#4caf50;">--</div>
                         <div class="stat-label">Pump</div>
@@ -1074,14 +1069,6 @@ HTML_TEMPLATE = """
                     <div class="stat-item">
                         <div class="stat-value" id="calcTarget">--</div>
                         <div class="stat-label">Börvärde</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="stat-value" id="flowRate">--</div>
-                        <div class="stat-label">Flöde m³/h</div>
-                    </div>
-                    <div class="stat-item">
-                        <div class="stat-value" id="compFreqStat">--</div>
-                        <div class="stat-label">Kompressor %</div>
                     </div>
                 </div>
                 <div class="stats" style="grid-template-columns: 1fr; margin-top: 10px;">
@@ -1598,10 +1585,6 @@ HTML_TEMPLATE = """
                 document.getElementById('powerOut').textContent = copData.heatPower > 0 ? copData.heatPower.toFixed(1) : '--';
                 document.getElementById('deltaT').textContent = copData.deltaT.toFixed(1);
                 document.getElementById('compFreq').textContent = t33.toFixed(0);
-
-                // Flow and compressor
-                document.getElementById('flowRate').textContent = (data.D12 || '--');
-                document.getElementById('compFreqStat').textContent = t33.toFixed(0) + '%';
 
                 // Pump active status
                 const pumpActiveEl = document.getElementById('pumpActive');
