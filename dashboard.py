@@ -1933,6 +1933,7 @@ HTML_TEMPLATE = """
                     <div class="stat-item" style="background: rgba(141, 110, 99, 0.3);">
                         <div class="stat-value" style="color:#8d6e63;"><span id="woodHours">--</span> / <span id="woodSessions">--</span></div>
                         <div class="stat-label">🪵 Eldning senaste 7 dygn (timmar / tillfällen)</div>
+                        <button id="importBtn" onclick="importHistory()" style="margin-top:8px; padding:4px 12px; font-size:11px; background:#444; color:#aaa; border:1px solid #555; border-radius:4px; cursor:pointer;">Importera 72h historik</button>
                     </div>
                 </div>
             </div>
@@ -2447,6 +2448,24 @@ HTML_TEMPLATE = """
             } catch (e) {
                 console.error('Energy fetch error:', e);
             }
+        }
+
+        // Import history from cloud API to database
+        async function importHistory() {
+            const btn = document.getElementById('importBtn');
+            btn.textContent = 'Importerar...';
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/import-history?hours=72');
+                const data = await res.json();
+                btn.textContent = 'Importerade ' + data.imported + ' punkter';
+                loadWoodStats(); // Refresh stats
+                loadHistory();   // Refresh history chart
+            } catch (e) {
+                btn.textContent = 'Fel vid import';
+                console.error('Import error:', e);
+            }
+            setTimeout(() => { btn.textContent = 'Importera 72h historik'; btn.disabled = false; }, 3000);
         }
 
         // Load wood heating stats from local database (7 days)
