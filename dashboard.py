@@ -5,17 +5,32 @@ With COP calculation, energy stats, and historical data
 Supports SQLite (local) and PostgreSQL (Railway)
 """
 
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, redirect, url_for, session, flash
 import os
 import threading
 import time
+import secrets
+import hashlib
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
+from functools import wraps
 from dotenv import load_dotenv
 from perifal_client import PerifalClient
 
 load_dotenv()
 
 app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
+
+# Email configuration
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "martin@strandholm.com")
+APP_URL = os.getenv("APP_URL", "https://web-production-3bb0d.up.railway.app")
 
 # Credentials
 USERNAME = os.getenv("PERIFAL_USERNAME")
@@ -92,6 +107,19 @@ def init_db():
                 UNIQUE(timestamp)
             )
         ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) NOT NULL UNIQUE,
+                password_hash VARCHAR(255) NOT NULL,
+                name VARCHAR(255),
+                email_verified BOOLEAN DEFAULT FALSE,
+                admin_approved BOOLEAN DEFAULT FALSE,
+                is_admin BOOLEAN DEFAULT FALSE,
+                verification_token VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
     else:
         cur.execute('''
             CREATE TABLE IF NOT EXISTS readings (
@@ -110,10 +138,260 @@ def init_db():
                 mode TEXT
             )
         ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                name TEXT,
+                email_verified INTEGER DEFAULT 0,
+                admin_approved INTEGER DEFAULT 0,
+                is_admin INTEGER DEFAULT 0,
+                verification_token TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
 
     conn.commit()
     conn.close()
     print("Database initialized", flush=True)
+
+# ============== User Authentication Functions ==============
+
+def hash_password(password):
+    """Hash a password with salt"""
+    salt = secrets.token_hex(16)
+    pwd_hash = hashlib.sha256((password + salt).encode()).hexdigest()
+    return f"{salt}:{pwd_hash}"
+
+def verify_password(password, stored_hash):
+    """Verify a password against stored hash"""
+    try:
+        salt, pwd_hash = stored_hash.split(':')
+        return hashlib.sha256((password + salt).encode()).hexdigest() == pwd_hash
+    except:
+        return False
+
+def send_email(to_email, subject, html_body):
+    """Send an email"""
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print(f"Email not configured - would send to {to_email}: {subject}", flush=True)
+        return False
+
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From'] = SMTP_USER
+        msg['To'] = to_email
+        msg.attach(MIMEText(html_body, 'html'))
+
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_USER, to_email, msg.as_string())
+
+        print(f"Email sent to {to_email}", flush=True)
+        return True
+    except Exception as e:
+        print(f"Email error: {e}", flush=True)
+        return False
+
+def create_user(email, password, name):
+    """Create a new user"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        password_hash = hash_password(password)
+        verification_token = secrets.token_urlsafe(32)
+
+        if USE_POSTGRES:
+            cur.execute('''
+                INSERT INTO users (email, password_hash, name, verification_token)
+                VALUES (%s, %s, %s, %s) RETURNING id
+            ''', (email.lower(), password_hash, name, verification_token))
+            user_id = cur.fetchone()[0]
+        else:
+            cur.execute('''
+                INSERT INTO users (email, password_hash, name, verification_token)
+                VALUES (?, ?, ?, ?)
+            ''', (email.lower(), password_hash, name, verification_token))
+            user_id = cur.lastrowid
+
+        conn.commit()
+        conn.close()
+
+        # Send verification email
+        verify_url = f"{APP_URL}/verify/{verification_token}"
+        send_email(email, "Verifiera din e-post - Perifal LV-418",
+            f"""<h2>Välkommen till Perifal LV-418 Dashboard!</h2>
+            <p>Klicka på länken nedan för att verifiera din e-postadress:</p>
+            <p><a href="{verify_url}">{verify_url}</a></p>
+            <p>Efter verifiering måste en administratör godkänna ditt konto.</p>""")
+
+        # Notify admin
+        send_email(ADMIN_EMAIL, "Ny användare väntar på godkännande - Perifal LV-418",
+            f"""<h2>Ny registrering</h2>
+            <p><strong>Namn:</strong> {name}</p>
+            <p><strong>E-post:</strong> {email}</p>
+            <p><a href="{APP_URL}/admin/approve/{user_id}">Klicka här för att godkänna</a></p>""")
+
+        return user_id
+    except Exception as e:
+        print(f"Create user error: {e}", flush=True)
+        return None
+
+def get_user_by_email(email):
+    """Get user by email"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if USE_POSTGRES:
+            cur.execute('SELECT * FROM users WHERE email = %s', (email.lower(),))
+        else:
+            cur.execute('SELECT * FROM users WHERE email = ?', (email.lower(),))
+
+        row = cur.fetchone()
+        conn.close()
+
+        if row:
+            if USE_POSTGRES:
+                return dict(zip(['id', 'email', 'password_hash', 'name', 'email_verified',
+                               'admin_approved', 'is_admin', 'verification_token', 'created_at'], row))
+            else:
+                return dict(row)
+        return None
+    except Exception as e:
+        print(f"Get user error: {e}", flush=True)
+        return None
+
+def ensure_admin_exists():
+    """Create initial admin user if no users exist"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if USE_POSTGRES:
+            cur.execute('SELECT COUNT(*) FROM users')
+        else:
+            cur.execute('SELECT COUNT(*) FROM users')
+
+        count = cur.fetchone()[0]
+        conn.close()
+
+        if count == 0:
+            # Create initial admin
+            admin_email = os.getenv("ADMIN_EMAIL", "martin@strandholm.com")
+            admin_password = os.getenv("ADMIN_PASSWORD", "admin123")  # Should be changed!
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            password_hash = hash_password(admin_password)
+
+            if USE_POSTGRES:
+                cur.execute('''
+                    INSERT INTO users (email, password_hash, name, email_verified, admin_approved, is_admin)
+                    VALUES (%s, %s, %s, TRUE, TRUE, TRUE)
+                ''', (admin_email.lower(), password_hash, 'Admin'))
+            else:
+                cur.execute('''
+                    INSERT INTO users (email, password_hash, name, email_verified, admin_approved, is_admin)
+                    VALUES (?, ?, ?, 1, 1, 1)
+                ''', (admin_email.lower(), password_hash, 'Admin'))
+
+            conn.commit()
+            conn.close()
+            print(f"Created initial admin user: {admin_email}", flush=True)
+    except Exception as e:
+        print(f"Ensure admin error: {e}", flush=True)
+
+def login_required(f):
+    """Decorator to require login"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def admin_required(f):
+    """Decorator to require admin"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session or not session.get('is_admin'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# ============== Cloud Data Import ==============
+
+def import_cloud_history():
+    """Import historical data from cloud to fill database"""
+    try:
+        print("Importing cloud history to database...", flush=True)
+        client = PerifalClient(USERNAME, PASSWORD)
+        if not client.login():
+            print("Failed to login for cloud import", flush=True)
+            return 0
+
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now() - timedelta(hours=72)).strftime('%Y-%m-%d %H:%M:%S')
+
+        # Fetch cloud data
+        flow_data = client.get_history(DEVICE_CODE, "2046", start_time, end_time, "day")
+        tank_data = client.get_history(DEVICE_CODE, "2047", start_time, end_time, "day")
+        outdoor_data = client.get_history(DEVICE_CODE, "2048", start_time, end_time, "day")
+        power_data = client.get_history(DEVICE_CODE, "2054", start_time, end_time, "day")
+
+        flow_values = flow_data.get('valueList', []) if isinstance(flow_data, dict) else []
+        tank_values = tank_data.get('valueList', []) if isinstance(tank_data, dict) else []
+        outdoor_values = outdoor_data.get('valueList', []) if isinstance(outdoor_data, dict) else []
+        power_values = power_data.get('valueList', []) if isinstance(power_data, dict) else []
+
+        flow_by_time = {v['dateTime']: float(v['addressValue']) for v in flow_values}
+        tank_by_time = {v['dateTime']: float(v['addressValue']) for v in tank_values}
+        outdoor_by_time = {v['dateTime']: float(v['addressValue']) for v in outdoor_values}
+        power_by_time = {v['dateTime']: float(v['addressValue']) for v in power_values}
+
+        all_times = set(flow_by_time.keys()) | set(tank_by_time.keys()) | set(outdoor_by_time.keys())
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        imported = 0
+
+        for dt_str in all_times:
+            try:
+                timestamp = datetime.strptime(dt_str, '%Y-%m-%d %H')
+                t02 = flow_by_time.get(dt_str)
+                t06 = tank_by_time.get(dt_str)
+                t04 = outdoor_by_time.get(dt_str)
+                t39 = power_by_time.get(dt_str)
+
+                if USE_POSTGRES:
+                    cur.execute('''
+                        INSERT INTO readings (timestamp, t02_flow, t06_tank, t04_outdoor, t39_power_kw)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (timestamp) DO NOTHING
+                    ''', (timestamp, t02, t06, t04, t39))
+                else:
+                    cur.execute('''
+                        INSERT OR IGNORE INTO readings (timestamp, t02_flow, t06_tank, t04_outdoor, t39_power_kw)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (timestamp.isoformat(), t02, t06, t04, t39))
+
+                imported += 1
+            except:
+                continue
+
+        conn.commit()
+        conn.close()
+        print(f"Imported {imported} readings from cloud", flush=True)
+        return imported
+    except Exception as e:
+        print(f"Cloud import error: {e}", flush=True)
+        return 0
 
 def log_reading(params):
     """Log a reading to the database"""
@@ -312,6 +590,154 @@ def stop_logger():
     logging_active = False
 
 # ============== End Database Functions ==============
+
+# ============== Auth Templates ==============
+
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Logga in - Perifal LV-418</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+               min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .container { background: #1e293b; padding: 40px; border-radius: 12px;
+                     box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 100%; max-width: 400px; }
+        h1 { color: #fff; text-align: center; margin-bottom: 30px; font-size: 24px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; color: #94a3b8; margin-bottom: 8px; font-size: 14px; }
+        input { width: 100%; padding: 12px; border: 1px solid #334155; border-radius: 6px;
+                background: #0f172a; color: #fff; font-size: 16px; }
+        input:focus { outline: none; border-color: #3b82f6; }
+        button { width: 100%; padding: 14px; background: #3b82f6; color: #fff; border: none;
+                 border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 10px; }
+        button:hover { background: #2563eb; }
+        .message { padding: 12px; border-radius: 6px; margin-bottom: 20px; text-align: center; }
+        .error { background: #7f1d1d; color: #fca5a5; }
+        .success { background: #14532d; color: #86efac; }
+        .link { text-align: center; margin-top: 20px; }
+        .link a { color: #3b82f6; text-decoration: none; }
+        .link a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Perifal LV-418</h1>
+        {% if error %}<div class="message error">{{ error }}</div>{% endif %}
+        {% if success %}<div class="message success">{{ success }}</div>{% endif %}
+        <form method="POST">
+            <div class="form-group">
+                <label>E-post</label>
+                <input type="email" name="email" required>
+            </div>
+            <div class="form-group">
+                <label>Lösenord</label>
+                <input type="password" name="password" required>
+            </div>
+            <button type="submit">Logga in</button>
+        </form>
+        <div class="link"><a href="/register">Skapa konto</a></div>
+    </div>
+</body>
+</html>
+"""
+
+REGISTER_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Registrera - Perifal LV-418</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+               min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .container { background: #1e293b; padding: 40px; border-radius: 12px;
+                     box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 100%; max-width: 400px; }
+        h1 { color: #fff; text-align: center; margin-bottom: 30px; font-size: 24px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; color: #94a3b8; margin-bottom: 8px; font-size: 14px; }
+        input { width: 100%; padding: 12px; border: 1px solid #334155; border-radius: 6px;
+                background: #0f172a; color: #fff; font-size: 16px; }
+        input:focus { outline: none; border-color: #3b82f6; }
+        button { width: 100%; padding: 14px; background: #3b82f6; color: #fff; border: none;
+                 border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 10px; }
+        button:hover { background: #2563eb; }
+        .message { padding: 12px; border-radius: 6px; margin-bottom: 20px; text-align: center; }
+        .error { background: #7f1d1d; color: #fca5a5; }
+        .success { background: #14532d; color: #86efac; }
+        .link { text-align: center; margin-top: 20px; }
+        .link a { color: #3b82f6; text-decoration: none; }
+        .link a:hover { text-decoration: underline; }
+        .info { color: #94a3b8; font-size: 13px; text-align: center; margin-top: 15px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Skapa konto</h1>
+        {% if error %}<div class="message error">{{ error }}</div>{% endif %}
+        {% if success %}<div class="message success">{{ success }}</div>{% endif %}
+        <form method="POST">
+            <div class="form-group">
+                <label>Namn</label>
+                <input type="text" name="name" required>
+            </div>
+            <div class="form-group">
+                <label>E-post</label>
+                <input type="email" name="email" required>
+            </div>
+            <div class="form-group">
+                <label>Lösenord</label>
+                <input type="password" name="password" required minlength="6">
+            </div>
+            <button type="submit">Registrera</button>
+        </form>
+        <div class="link"><a href="/login">Har redan konto? Logga in</a></div>
+        <div class="info">Efter registrering behöver du verifiera din e-post och invänta admin-godkännande.</div>
+    </div>
+</body>
+</html>
+"""
+
+MESSAGE_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ title }} - Perifal LV-418</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+               min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .container { background: #1e293b; padding: 40px; border-radius: 12px;
+                     box-shadow: 0 4px 20px rgba(0,0,0,0.3); width: 100%; max-width: 400px; text-align: center; }
+        h1 { color: #fff; margin-bottom: 20px; font-size: 24px; }
+        .message { color: #94a3b8; font-size: 16px; line-height: 1.6; }
+        .success { color: #86efac; }
+        .error { color: #fca5a5; }
+        .link { margin-top: 25px; }
+        .link a { color: #3b82f6; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>{{ title }}</h1>
+        <div class="message {{ msg_class }}">{{ message }}</div>
+        <div class="link"><a href="/login">Gå till inloggning</a></div>
+    </div>
+</body>
+</html>
+"""
+
+# ============== End Auth Templates ==============
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -568,6 +994,7 @@ HTML_TEMPLATE = """
                 <span id="compBadge" class="badge compressor" style="display:none">KOMPRESSOR</span>
                 <span id="woodBadge" class="badge wood" style="display:none">VEDELDNING</span>
                 <span id="silentBadge" class="badge silent" style="display:none">TYST</span>
+                <a href="/logout" class="badge" style="background:#546e7a;text-decoration:none;cursor:pointer">LOGGA UT</a>
             </div>
         </header>
 
@@ -1547,7 +1974,159 @@ def get_client():
     client.login()
     return client
 
+# ============== Auth Routes ==============
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '')
+
+        user = get_user_by_email(email)
+        if not user:
+            return render_template_string(LOGIN_TEMPLATE, error="Felaktig e-post eller lösenord")
+
+        if not verify_password(password, user['password_hash']):
+            return render_template_string(LOGIN_TEMPLATE, error="Felaktig e-post eller lösenord")
+
+        if not user['email_verified']:
+            return render_template_string(LOGIN_TEMPLATE, error="Du behöver verifiera din e-postadress först")
+
+        if not user['admin_approved']:
+            return render_template_string(LOGIN_TEMPLATE, error="Ditt konto väntar på admin-godkännande")
+
+        # Login successful
+        session['user_id'] = user['id']
+        session['user_email'] = user['email']
+        session['user_name'] = user['name']
+        session['is_admin'] = bool(user['is_admin'])
+        return redirect(url_for('index'))
+
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '')
+
+        if not name or not email or not password:
+            return render_template_string(REGISTER_TEMPLATE, error="Alla fält måste fyllas i")
+
+        if len(password) < 6:
+            return render_template_string(REGISTER_TEMPLATE, error="Lösenordet måste vara minst 6 tecken")
+
+        # Check if user exists
+        existing = get_user_by_email(email)
+        if existing:
+            return render_template_string(REGISTER_TEMPLATE, error="E-postadressen är redan registrerad")
+
+        # Create user
+        user_id = create_user(email, password, name)
+        if user_id:
+            return render_template_string(REGISTER_TEMPLATE,
+                success="Konto skapat! Kolla din e-post för verifieringslänk.")
+        else:
+            return render_template_string(REGISTER_TEMPLATE, error="Kunde inte skapa konto, försök igen")
+
+    return render_template_string(REGISTER_TEMPLATE)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route('/verify/<token>')
+def verify_email(token):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if USE_POSTGRES:
+            cur.execute('SELECT id, email FROM users WHERE verification_token = %s', (token,))
+        else:
+            cur.execute('SELECT id, email FROM users WHERE verification_token = ?', (token,))
+
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return render_template_string(MESSAGE_TEMPLATE,
+                title="Ogiltig länk", message="Verifieringslänken är ogiltig eller har redan använts.",
+                msg_class="error")
+
+        if USE_POSTGRES:
+            cur.execute('UPDATE users SET email_verified = TRUE, verification_token = NULL WHERE id = %s', (row[0],))
+        else:
+            cur.execute('UPDATE users SET email_verified = 1, verification_token = NULL WHERE id = ?', (row[0],))
+
+        conn.commit()
+        conn.close()
+
+        return render_template_string(MESSAGE_TEMPLATE,
+            title="E-post verifierad!", message="Din e-postadress är nu verifierad. En administratör kommer granska och godkänna ditt konto.",
+            msg_class="success")
+    except Exception as e:
+        print(f"Verify error: {e}", flush=True)
+        return render_template_string(MESSAGE_TEMPLATE,
+            title="Fel", message="Ett fel uppstod vid verifiering.",
+            msg_class="error")
+
+@app.route('/admin/approve/<int:user_id>')
+def admin_approve(user_id):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if USE_POSTGRES:
+            cur.execute('SELECT email, name, email_verified FROM users WHERE id = %s', (user_id,))
+        else:
+            cur.execute('SELECT email, name, email_verified FROM users WHERE id = ?', (user_id,))
+
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return render_template_string(MESSAGE_TEMPLATE,
+                title="Användare finns inte", message="Användaren kunde inte hittas.",
+                msg_class="error")
+
+        if USE_POSTGRES:
+            cur.execute('UPDATE users SET admin_approved = TRUE WHERE id = %s', (user_id,))
+        else:
+            cur.execute('UPDATE users SET admin_approved = 1 WHERE id = ?', (user_id,))
+
+        conn.commit()
+        conn.close()
+
+        email = row[0] if USE_POSTGRES else row['email']
+        name = row[1] if USE_POSTGRES else row['name']
+
+        # Notify user
+        send_email(email, "Ditt konto har godkänts - Perifal LV-418",
+            f"""<h2>Välkommen {name}!</h2>
+            <p>Ditt konto har nu godkänts av en administratör.</p>
+            <p><a href="{APP_URL}/login">Klicka här för att logga in</a></p>""")
+
+        return render_template_string(MESSAGE_TEMPLATE,
+            title="Användare godkänd", message=f"{name} ({email}) har nu godkänts och kan logga in.",
+            msg_class="success")
+    except Exception as e:
+        print(f"Approve error: {e}", flush=True)
+        return render_template_string(MESSAGE_TEMPLATE,
+            title="Fel", message="Ett fel uppstod vid godkännande.",
+            msg_class="error")
+
+@app.route('/api/import-cloud')
+@admin_required
+def api_import_cloud():
+    """Import cloud history to database (admin only)"""
+    imported = import_cloud_history()
+    return jsonify({'imported': imported})
+
+# ============== End Auth Routes ==============
+
 @app.route('/')
+@login_required
 def index():
     return render_template_string(HTML_TEMPLATE)
 
@@ -1781,6 +2360,7 @@ def api_local_history():
 
 # Initialize on module load (for gunicorn)
 init_db()
+ensure_admin_exists()
 start_logger()
 
 if __name__ == '__main__':
