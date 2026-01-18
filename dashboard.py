@@ -54,16 +54,30 @@ else:
     DB_PATH = os.path.join(os.path.dirname(__file__), 'perifal_history.db')
 
 # All parameters to fetch
+# T01=Inkommande vatten, T02=Utgående vatten, T03=Förångargastemp, T04=Utomhustemp
+# T05=Sugggastemp, T06=Kondensortemp, T07=Bufferttank, T08=Tank, T09=Rumstemp
+# T10=EVI inlopp, T11=EVI utlopp, T12=Hetgastemp, T14=Spridarrör, T15=Lågtryck
+# T33=IPM larmtemp, T34=AC spänning, T35=AC ström, T36=Kompressor fasström
+# T37=DC styrspänning, T38=IPM temp, T39=Vattenflöde, T45=Högtryck
+# T49=Förångargastemp, T50=Underkylning, T51=Överhettning, T52-54=Ström L1-L3
 ALL_PARAMS = [
     "Power", "Mode", "ModeState",
-    "T01", "T02", "T03", "T04", "T05", "T06", "T08", "T10", "T11", "T12", "T15",
-    "T33", "T34", "T35", "T36", "T37", "T38", "T39", "T53",
+    # Temperaturer
+    "T01", "T02", "T03", "T04", "T05", "T06", "T07", "T08", "T09",
+    "T10", "T11", "T12", "T14", "T15",
+    # Kompressor/IPM
+    "T33", "T34", "T35", "T36", "T37", "T38", "T39",
+    # Tryck och överhettning
+    "T45", "T49", "T50", "T51",
+    # Strömmätning
+    "T52", "T53", "T54",
+    # Inställningar
     "R01", "M1 Hot Water Target", "M1 Heating Target",
     "compensate_offset", "compensate_slope",
     "M1 Max. Power",
     "hanControl", "Fault1", "Fault5", "Fault6",
     "app_heartbeat", "O15", "O17",
-    "D12", "D14", "D15", "T38",
+    "D12", "D14", "D15",
     "SG Status", "SG01",
     # Numeric codes for power/energy
     "2054",  # Electrical power (kW)
@@ -1519,12 +1533,51 @@ SETTINGS_TEMPLATE = """
                 powerBtn.textContent = pumpPower ? 'PÅ' : 'AV';
                 powerBtn.className = 'toggle ' + (pumpPower ? 'active' : 'inactive');
 
+                // Parameter descriptions
+                const paramNames = {
+                    'T01': 'Inkommande vatten',
+                    'T02': 'Utgående vatten',
+                    'T03': 'Förångargastemp',
+                    'T04': 'Utomhustemp',
+                    'T05': 'Sugggastemp',
+                    'T06': 'Kondensortemp',
+                    'T07': 'Bufferttank temp',
+                    'T08': 'Tank',
+                    'T09': 'Rumstemp',
+                    'T10': 'EVI inloppstemp',
+                    'T11': 'EVI utloppstemp',
+                    'T12': 'Hetgastemp',
+                    'T14': 'Spridarrörstemp',
+                    'T15': 'Lågtryck',
+                    'T33': 'IPM larmtemp',
+                    'T34': 'AC inspänning',
+                    'T35': 'AC inström',
+                    'T36': 'Kompressor fasström',
+                    'T37': 'DC styrspänning',
+                    'T38': 'IPM temp',
+                    'T39': 'Vattenflöde',
+                    'T45': 'Högtryck',
+                    'T49': 'Förångargastemp',
+                    'T50': 'Underkylning',
+                    'T51': 'Överhettning',
+                    'T52': 'Ström L1',
+                    'T53': 'Ström L2',
+                    'T54': 'Ström L3',
+                    '2054': 'Elförbrukning kW',
+                    'compensate_offset': 'AT kurva offset',
+                    'compensate_slope': 'AT kurva lutning',
+                    'M1 Heating Target': 'Börvärde värme',
+                    'M1 Hot Water Target': 'Börvärde varmvatten',
+                    'R01': 'Varmvattentemp'
+                };
+
                 // Debug table
                 const tbody = document.getElementById('paramTableBody');
                 const sortedKeys = Object.keys(data).sort();
-                tbody.innerHTML = sortedKeys.map(key =>
-                    `<tr><td>${key}</td><td>${data[key]}</td></tr>`
-                ).join('');
+                tbody.innerHTML = sortedKeys.map(key => {
+                    const desc = paramNames[key] ? ` <span style="color:#888">(${paramNames[key]})</span>` : '';
+                    return `<tr><td>${key}${desc}</td><td>${data[key]}</td></tr>`;
+                }).join('');
 
                 document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
 
