@@ -2101,21 +2101,24 @@ HTML_TEMPLATE = """
                         },
                         y: {
                             position: 'left',
+                            suggestedMin: -10,
                             ticks: { color: '#666' },
                             grid: { color: 'rgba(255,255,255,0.05)' },
                             title: { display: true, text: '°C', color: '#666' }
                         },
                         y1: {
                             position: 'right',
-                            min: 0,
-                            max: 20,
+                            suggestedMin: -10,
                             ticks: {
-                                color: '#4caf50',
-                                stepSize: 4,
-                                callback: val => val / 4  // Show 0,1,2,3,4,5 instead of 0,4,8,12,16,20
+                                color: '#ffca28',
+                                callback: function(val) {
+                                    // Only show labels at 0,4,8,12,16,20 as 0,1,2,3,4,5
+                                    if ([0, 4, 8, 12, 16, 20].includes(val)) return val / 4;
+                                    return null;
+                                }
                             },
                             grid: { drawOnChartArea: false },
-                            title: { display: true, text: 'COP / kW', color: '#4caf50' }
+                            title: { display: true, text: 'kW / COP', color: '#ffca28' }
                         }
                     }
                 }
