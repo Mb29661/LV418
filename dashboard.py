@@ -1,0 +1,1800 @@
+#!/usr/bin/env python3
+"""
+Perifal LV-418 Advanced Web Dashboard
+With COP calculation, energy stats, and historical data
+Supports SQLite (local) and PostgreSQL (Railway)
+"""
+
+from flask import Flask, render_template_string, jsonify, request
+import os
+import threading
+import time
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from perifal_client import PerifalClient
+
+load_dotenv()
+
+app = Flask(__name__)
+
+# Credentials
+USERNAME = os.getenv("PERIFAL_USERNAME")
+PASSWORD = os.getenv("PERIFAL_PASSWORD")
+DEVICE_CODE = os.getenv("PERIFAL_DEVICE_CODE", "A09A520276BA")
+
+# Database configuration - PostgreSQL on Railway, SQLite locally
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL:
+    # Railway PostgreSQL
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    USE_POSTGRES = True
+    # Fix Railway's postgres:// URL to postgresql://
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+else:
+    # Local SQLite
+    import sqlite3
+    USE_POSTGRES = False
+    DB_PATH = os.path.join(os.path.dirname(__file__), 'perifal_history.db')
+
+# All parameters to fetch
+ALL_PARAMS = [
+    "Power", "Mode", "ModeState",
+    "T01", "T02", "T03", "T04", "T05", "T06", "T08", "T10", "T11", "T12", "T15",
+    "T33", "T34", "T35", "T36", "T37", "T38", "T39",
+    "R01", "M1 Hot Water Target", "M1 Heating Target",
+    "compensate_offset", "compensate_slope",
+    "M1 Max. Power",
+    "hanControl", "Fault1", "Fault5", "Fault6",
+    "app_heartbeat", "O15", "O17",
+    "D12", "D14", "D15", "T38",
+    "SG Status", "SG01",
+    # Curve points (AT compensation)
+    "CP1-1", "CP1-2", "CP1-3", "CP1-4", "CP1-5", "CP1-6", "CP1-7",
+    # Zone 2
+    "Zone 2 Curve Offset", "Zone 2 Cure Slope", "Zone 2 Water Target",
+]
+
+# ============== Database Functions ==============
+
+def get_db_connection():
+    """Get database connection (PostgreSQL or SQLite)"""
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+def init_db():
+    """Initialize database tables"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    if USE_POSTGRES:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS readings (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP NOT NULL,
+                t01_return REAL,
+                t02_flow REAL,
+                t04_outdoor REAL,
+                t06_tank REAL,
+                t12_compressor REAL,
+                t33_comp_freq REAL,
+                t39_power_kw REAL,
+                d12_flow_rate REAL,
+                cop_calculated REAL,
+                heat_power_kw REAL,
+                mode VARCHAR(10),
+                UNIQUE(timestamp)
+            )
+        ''')
+    else:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL UNIQUE,
+                t01_return REAL,
+                t02_flow REAL,
+                t04_outdoor REAL,
+                t06_tank REAL,
+                t12_compressor REAL,
+                t33_comp_freq REAL,
+                t39_power_kw REAL,
+                d12_flow_rate REAL,
+                cop_calculated REAL,
+                heat_power_kw REAL,
+                mode TEXT
+            )
+        ''')
+
+    conn.commit()
+    conn.close()
+    print("Database initialized", flush=True)
+
+def log_reading(params):
+    """Log a reading to the database"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Calculate COP
+        t39 = float(params.get('T39', 0) or 0)
+        t02 = float(params.get('T02', 0) or 0)
+        t01 = float(params.get('T01', 0) or 0)
+        d12 = float(params.get('D12', 0) or 0)
+
+        delta_t = t02 - t01
+        flow_lmin = d12 * 1000 / 60  # m³/h to l/min
+        heat_power = (flow_lmin * delta_t * 4.186) / 60 if flow_lmin > 0 else 0
+        cop = heat_power / t39 if t39 > 0.1 else None
+
+        timestamp = datetime.now().replace(minute=0, second=0, microsecond=0)
+
+        if USE_POSTGRES:
+            cur.execute('''
+                INSERT INTO readings (timestamp, t01_return, t02_flow, t04_outdoor, t06_tank,
+                    t12_compressor, t33_comp_freq, t39_power_kw, d12_flow_rate, cop_calculated, heat_power_kw, mode)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (timestamp) DO UPDATE SET
+                    t01_return = EXCLUDED.t01_return,
+                    t02_flow = EXCLUDED.t02_flow,
+                    t04_outdoor = EXCLUDED.t04_outdoor,
+                    t06_tank = EXCLUDED.t06_tank,
+                    t12_compressor = EXCLUDED.t12_compressor,
+                    t33_comp_freq = EXCLUDED.t33_comp_freq,
+                    t39_power_kw = EXCLUDED.t39_power_kw,
+                    d12_flow_rate = EXCLUDED.d12_flow_rate,
+                    cop_calculated = EXCLUDED.cop_calculated,
+                    heat_power_kw = EXCLUDED.heat_power_kw,
+                    mode = EXCLUDED.mode
+            ''', (
+                timestamp,
+                float(params.get('T01', 0) or 0),
+                float(params.get('T02', 0) or 0),
+                float(params.get('T04', 0) or 0),
+                float(params.get('T06', 0) or 0),
+                float(params.get('T12', 0) or 0),
+                float(params.get('T33', 0) or 0),
+                t39,
+                d12,
+                cop,
+                heat_power,
+                params.get('Mode', '')
+            ))
+        else:
+            cur.execute('''
+                INSERT OR REPLACE INTO readings (timestamp, t01_return, t02_flow, t04_outdoor, t06_tank,
+                    t12_compressor, t33_comp_freq, t39_power_kw, d12_flow_rate, cop_calculated, heat_power_kw, mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                timestamp.isoformat(),
+                float(params.get('T01', 0) or 0),
+                float(params.get('T02', 0) or 0),
+                float(params.get('T04', 0) or 0),
+                float(params.get('T06', 0) or 0),
+                float(params.get('T12', 0) or 0),
+                float(params.get('T33', 0) or 0),
+                t39,
+                d12,
+                cop,
+                heat_power,
+                params.get('Mode', '')
+            ))
+
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"Error logging reading: {e}", flush=True)
+        return False
+
+def get_local_history(hours=72):
+    """Get history from local database"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if USE_POSTGRES:
+            cur.execute('''
+                SELECT timestamp, t01_return, t02_flow, t04_outdoor, t06_tank,
+                       t39_power_kw, cop_calculated
+                FROM readings
+                WHERE timestamp > NOW() - INTERVAL '%s hours'
+                ORDER BY timestamp ASC
+            ''', (hours,))
+        else:
+            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+            cur.execute('''
+                SELECT timestamp, t01_return, t02_flow, t04_outdoor, t06_tank,
+                       t39_power_kw, cop_calculated
+                FROM readings
+                WHERE timestamp > ?
+                ORDER BY timestamp ASC
+            ''', (cutoff,))
+
+        rows = cur.fetchall()
+        conn.close()
+
+        readings = []
+        for row in rows:
+            if USE_POSTGRES:
+                readings.append({
+                    'timestamp': row[0].isoformat() if row[0] else None,
+                    't01_return': row[1],
+                    't02_flow': row[2],
+                    't04_outdoor': row[3],
+                    't06': row[4],
+                    't39_power_kw': row[5],
+                    'cop_calculated': row[6]
+                })
+            else:
+                readings.append({
+                    'timestamp': row['timestamp'],
+                    't01_return': row['t01_return'],
+                    't02_flow': row['t02_flow'],
+                    't04_outdoor': row['t04_outdoor'],
+                    't06': row['t06_tank'],
+                    't39_power_kw': row['t39_power_kw'],
+                    'cop_calculated': row['cop_calculated']
+                })
+
+        return readings
+    except Exception as e:
+        print(f"Error getting local history: {e}", flush=True)
+        return []
+
+def get_db_stats():
+    """Get database statistics"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        if USE_POSTGRES:
+            cur.execute('SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM readings')
+        else:
+            cur.execute('SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM readings')
+
+        row = cur.fetchone()
+        conn.close()
+
+        return {
+            'count': row[0] if row else 0,
+            'oldest': row[1] if row else None,
+            'newest': row[2] if row else None
+        }
+    except Exception as e:
+        print(f"Error getting db stats: {e}", flush=True)
+        return {'count': 0, 'oldest': None, 'newest': None}
+
+# Background logging thread
+logging_active = False
+
+def background_logger():
+    """Background thread that logs data every 10 minutes"""
+    global logging_active
+    print("Background logger started", flush=True)
+
+    while logging_active:
+        try:
+            client = PerifalClient(USERNAME, PASSWORD)
+            if client.login():
+                params = client.get_all_parameters(DEVICE_CODE, ALL_PARAMS)
+                if params:
+                    if log_reading(params):
+                        stats = get_db_stats()
+                        print(f"Logged reading at {datetime.now().strftime('%H:%M')} - DB has {stats['count']} readings", flush=True)
+        except Exception as e:
+            print(f"Logger error: {e}", flush=True)
+
+        # Sleep 10 minutes (check every 10 sec if we should stop)
+        for _ in range(60):
+            if not logging_active:
+                break
+            time.sleep(10)
+
+    print("Background logger stopped", flush=True)
+
+def start_logger():
+    """Start the background logger"""
+    global logging_active
+    if not logging_active:
+        logging_active = True
+        thread = threading.Thread(target=background_logger, daemon=True)
+        thread.start()
+
+def stop_logger():
+    """Stop the background logger"""
+    global logging_active
+    logging_active = False
+
+# ============== End Database Functions ==============
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Perifal LV-418 Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 15px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        h1 { font-size: 1.5em; }
+        .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+        .badge {
+            padding: 5px 12px;
+            border-radius: 15px;
+            font-size: 0.8em;
+            font-weight: 500;
+        }
+        .badge.online { background: #00c853; }
+        .badge.offline { background: #ff5252; }
+        .badge.heating { background: #ff7043; }
+        .badge.hotwater { background: #ffca28; color: #000; }
+        .badge.idle { background: #546e7a; }
+        .badge.silent { background: #9c27b0; }
+        .badge.compressor { background: #2196f3; }
+        .badge.wood { background: #8d6e63; }
+        .badge.stopped { background: #ff5252; }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+        .grid-wide {
+            grid-template-columns: 1fr;
+        }
+
+        .card {
+            background: rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 15px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .card h2 {
+            font-size: 0.9em;
+            margin-bottom: 12px;
+            color: #90caf9;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* COP Card */
+        .cop-display { text-align: center; padding: 15px 0; }
+        .cop-value {
+            font-size: 3.5em;
+            font-weight: bold;
+            background: linear-gradient(135deg, #4caf50, #8bc34a);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .cop-label { color: #90caf9; margin-top: 5px; font-size: 0.85em; }
+        .cop-details {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            margin-top: 12px;
+            font-size: 0.8em;
+        }
+        .cop-detail {
+            background: rgba(0,0,0,0.2);
+            padding: 8px;
+            border-radius: 6px;
+            text-align: center;
+        }
+        .cop-detail-value { font-size: 1.3em; font-weight: bold; }
+        .cop-detail-label { color: #90caf9; font-size: 0.75em; }
+
+        /* Temperature grid */
+        .temps {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+        }
+        .temp-item {
+            text-align: center;
+            padding: 10px 6px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 6px;
+        }
+        .temp-value { font-size: 1.4em; font-weight: bold; }
+        .temp-label { font-size: 0.65em; color: #90caf9; margin-top: 2px; }
+        .temp-outdoor .temp-value { color: #64b5f6; }
+        .temp-flow .temp-value { color: #ef5350; }
+        .temp-return .temp-value { color: #ff7043; }
+        .temp-hw .temp-value { color: #ffca28; }
+        .temp-tank .temp-value { color: #ce93d8; }
+        .temp-evap .temp-value { color: #4dd0e1; }
+        .temp-comp .temp-value { color: #ff5722; }
+
+        /* Stats */
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+        }
+        .stat-item {
+            background: rgba(0,0,0,0.2);
+            padding: 10px;
+            border-radius: 6px;
+            text-align: center;
+        }
+        .stat-value { font-size: 1.3em; font-weight: bold; }
+        .stat-label { font-size: 0.7em; color: #90caf9; }
+
+        /* Controls */
+        .controls {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 8px;
+            max-width: 100%;
+            overflow: hidden;
+        }
+        .control-item {
+            background: rgba(0,0,0,0.2);
+            border-radius: 6px;
+            padding: 10px;
+            min-width: 0;
+        }
+        .control-item input, .control-item select {
+            max-width: 80px;
+        }
+        .control-item label {
+            display: block;
+            font-size: 0.7em;
+            color: #90caf9;
+            margin-bottom: 5px;
+        }
+        .control-row { display: flex; gap: 6px; }
+        input[type="number"], input[type="date"], select {
+            flex: 1;
+            padding: 6px;
+            border: none;
+            border-radius: 5px;
+            background: rgba(255,255,255,0.9);
+            font-size: 0.9em;
+        }
+        button {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 5px;
+            background: #2196f3;
+            color: white;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+        button:hover { background: #1976d2; }
+        button.toggle { width: 100%; padding: 10px; }
+        button.toggle.active { background: #00c853; }
+        button.toggle.inactive { background: #546e7a; }
+
+        /* Chart */
+        .chart-controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .chart-controls label { font-size: 0.8em; color: #90caf9; }
+        .chart-controls select, .chart-controls input {
+            padding: 5px 10px;
+            border-radius: 5px;
+            border: none;
+            font-size: 0.85em;
+        }
+        .chart-container {
+            position: relative;
+            height: 300px;
+        }
+
+        /* Status indicator */
+        .pump-status {
+            text-align: center;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+        .pump-status.running { background: rgba(0,200,83,0.2); border: 1px solid #00c853; }
+        .pump-status.stopped { background: rgba(255,82,82,0.2); border: 1px solid #ff5252; }
+        .pump-status.wood { background: rgba(141,110,99,0.3); border: 1px solid #8d6e63; }
+        .pump-status h3 { font-size: 1.1em; margin-bottom: 5px; }
+        .pump-status p { font-size: 0.85em; color: #aaa; }
+
+        .update-info {
+            text-align: center;
+            color: #546e7a;
+            font-size: 0.7em;
+            margin-top: 15px;
+        }
+
+        .message {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 10px 20px;
+            border-radius: 6px;
+            background: #00c853;
+            color: white;
+            display: none;
+            z-index: 100;
+            font-size: 0.9em;
+        }
+        .message.error { background: #ff5252; }
+        .message.show { display: block; }
+
+        @media (max-width: 600px) {
+            .temps { grid-template-columns: repeat(2, 1fr); }
+            .cop-value { font-size: 2.5em; }
+            .chart-container { height: 250px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔥 Perifal LV-418</h1>
+            <div class="badges">
+                <span id="statusBadge" class="badge online">ONLINE</span>
+                <span id="modeBadge" class="badge heating">VÄRME</span>
+                <span id="compBadge" class="badge compressor" style="display:none">KOMPRESSOR</span>
+                <span id="woodBadge" class="badge wood" style="display:none">VEDELDNING</span>
+                <span id="silentBadge" class="badge silent" style="display:none">TYST</span>
+            </div>
+        </header>
+
+        <!-- Pump status indicator -->
+        <div id="pumpStatus" class="pump-status running">
+            <h3 id="pumpStatusTitle">🟢 Värmepump aktiv</h3>
+            <p id="pumpStatusDesc">Kompressorn körs</p>
+        </div>
+
+        <div class="grid">
+            <!-- COP Card -->
+            <div class="card">
+                <h2>⚡ Effektivitet</h2>
+                <div class="cop-display">
+                    <div class="cop-value" id="copValue">--</div>
+                    <div class="cop-label">COP (Coefficient of Performance)</div>
+                </div>
+                <div class="cop-details">
+                    <div class="cop-detail">
+                        <div class="cop-detail-value" id="powerIn">--</div>
+                        <div class="cop-detail-label">El in (kW)</div>
+                    </div>
+                    <div class="cop-detail">
+                        <div class="cop-detail-value" id="powerOut">--</div>
+                        <div class="cop-detail-label">Värme ut (kW)</div>
+                    </div>
+                    <div class="cop-detail">
+                        <div class="cop-detail-value" id="deltaT">--</div>
+                        <div class="cop-detail-label">ΔT (°C)</div>
+                    </div>
+                    <div class="cop-detail">
+                        <div class="cop-detail-value" id="compFreq">--</div>
+                        <div class="cop-detail-label">Kompressor %</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Temperatures -->
+            <div class="card">
+                <h2>🌡️ Temperaturer</h2>
+                <div class="temps">
+                    <div class="temp-item temp-outdoor">
+                        <div class="temp-value" id="tempOutdoor">--</div>
+                        <div class="temp-label">Utomhus</div>
+                    </div>
+                    <div class="temp-item temp-flow">
+                        <div class="temp-value" id="tempFlow">--</div>
+                        <div class="temp-label">Utgående</div>
+                    </div>
+                    <div class="temp-item temp-return">
+                        <div class="temp-value" id="tempIngåenden">--</div>
+                        <div class="temp-label">Ingående</div>
+                    </div>
+                    <div class="temp-item temp-tank">
+                        <div class="temp-value" id="tempTank">--</div>
+                        <div class="temp-label">Ackumulatortank</div>
+                    </div>
+                    <div class="temp-item temp-comp">
+                        <div class="temp-value" id="tempComp">--</div>
+                        <div class="temp-label">Kompressor</div>
+                    </div>
+                    <div class="temp-item temp-evap">
+                        <div class="temp-value" id="tempEvap">--</div>
+                        <div class="temp-label">Förångare</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stats -->
+            <div class="card">
+                <h2>📊 Driftdata</h2>
+                <div class="stats" style="grid-template-columns: repeat(3, 1fr);">
+                    <div class="stat-item">
+                        <div class="stat-value" id="pumpActive" style="color:#4caf50;">--</div>
+                        <div class="stat-label">Pump</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="calcTarget">--</div>
+                        <div class="stat-label">Börvärde</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="flowRate">--</div>
+                        <div class="stat-label">Flöde m³/h</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="compFreqStat">--</div>
+                        <div class="stat-label">Kompressor %</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="pressure1">--</div>
+                        <div class="stat-label">Tryck LP</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-value" id="pressure2">--</div>
+                        <div class="stat-label">Tryck HP</div>
+                    </div>
+                </div>
+                <div class="stats" style="grid-template-columns: 1fr; margin-top: 10px;">
+                    <div class="stat-item" style="background: rgba(141, 110, 99, 0.3);">
+                        <div class="stat-value" style="color:#8d6e63;"><span id="woodHours">--</span> / <span id="woodSessions">--</span></div>
+                        <div class="stat-label">🪵 Eldning senaste 72h (timmar / tillfällen)</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- AT Compensation Curve -->
+            <div class="card">
+                <h2>📉 Värmekurva (AT-kompensation)</h2>
+                <div class="chart-container" style="height:200px;">
+                    <canvas id="curveChart"></canvas>
+                </div>
+                <div style="font-size:0.75em;color:#888;margin-top:8px;text-align:center;">
+                    Visar måltemperatur (framledning) vid olika utomhustemperaturer
+                    <br><span id="curveInfo">--</span>
+                </div>
+            </div>
+
+            <!-- Controls (collapsed by default) -->
+            <div class="card">
+                <h2 onclick="toggleControls()" style="cursor:pointer;">
+                    ⚙️ Styrning <span id="controlsArrow" style="font-size:0.8em;">▶</span>
+                    <span style="color:#ff8a80;font-size:0.65em;margin-left:10px;">⚠️ Kräver lösenord</span>
+                </h2>
+                <div id="controlsPanel" style="display:none;">
+                    <p style="font-size:0.75em;color:#888;margin-bottom:12px;">Ändra endast om du vet vad du gör. Felaktiga värden kan skada systemet.</p>
+
+                    <h3 style="font-size:0.8em;color:#90caf9;margin:12px 0 8px 0;">Grundinställningar</h3>
+                    <div class="controls">
+                        <div class="control-item">
+                            <label>Kurva offset</label>
+                            <div class="control-row">
+                                <input type="number" id="inputCurveOffset" step="0.5" min="15" max="60">
+                                <button onclick="safeSetParam('compensate_offset', document.getElementById('inputCurveOffset').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>Kurva lutning</label>
+                            <div class="control-row">
+                                <input type="number" id="inputCurveSlope" step="0.1" min="0" max="3.5">
+                                <button onclick="safeSetParam('compensate_slope', document.getElementById('inputCurveSlope').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>VV börvärde</label>
+                            <div class="control-row">
+                                <input type="number" id="inputHwTarget" step="1" min="30" max="58">
+                                <button onclick="safeSetParam('R01', document.getElementById('inputHwTarget').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>Tyst läge</label>
+                            <button id="silentBtn" class="toggle inactive" onclick="safeToggleSilent()">AV</button>
+                        </div>
+                    </div>
+
+                    <h3 style="font-size:0.8em;color:#90caf9;margin:16px 0 8px 0;">Avancerat</h3>
+                    <div class="controls">
+                        <div class="control-item">
+                            <label>Värme börvärde (M1)</label>
+                            <div class="control-row">
+                                <input type="number" id="inputM1HeatTarget" step="1" min="15" max="60">
+                                <button onclick="safeSetParam('M1 Heating Target', document.getElementById('inputM1HeatTarget').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>Max effekt %</label>
+                            <div class="control-row">
+                                <input type="number" id="inputMaxPower" step="5" min="0" max="100">
+                                <button onclick="safeSetParam('M1 Max. Power', document.getElementById('inputMaxPower').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>Pump PÅ/AV</label>
+                            <button id="powerBtn" class="toggle active" onclick="safeTogglePower()">PÅ</button>
+                        </div>
+                        <div class="control-item">
+                            <label>Kurvpunkt 1 (CP1-1)</label>
+                            <div class="control-row">
+                                <input type="number" id="inputCP1_1" step="1">
+                                <button onclick="safeSetParam('CP1-1', document.getElementById('inputCP1_1').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>Kurvpunkt 2 (CP1-2)</label>
+                            <div class="control-row">
+                                <input type="number" id="inputCP1_2" step="1">
+                                <button onclick="safeSetParam('CP1-2', document.getElementById('inputCP1_2').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>Kurvpunkt 3 (CP1-3)</label>
+                            <div class="control-row">
+                                <input type="number" id="inputCP1_3" step="1">
+                                <button onclick="safeSetParam('CP1-3', document.getElementById('inputCP1_3').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>Zone 2 Offset</label>
+                            <div class="control-row">
+                                <input type="number" id="inputZ2Offset" step="0.5">
+                                <button onclick="safeSetParam('Zone 2 Curve Offset', document.getElementById('inputZ2Offset').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>Zone 2 Slope</label>
+                            <div class="control-row">
+                                <input type="number" id="inputZ2Slope" step="0.1">
+                                <button onclick="safeSetParam('Zone 2 Cure Slope', document.getElementById('inputZ2Slope').value)">OK</button>
+                            </div>
+                        </div>
+                        <div class="control-item">
+                            <label>SG Ready läge</label>
+                            <div class="control-row">
+                                <select id="inputSG">
+                                    <option value="0">Av</option>
+                                    <option value="1">Normal</option>
+                                    <option value="2">Lågt elpris</option>
+                                    <option value="3">Överskott</option>
+                                </select>
+                                <button onclick="safeSetParam('SG Status', document.getElementById('inputSG').value)">OK</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Historical Chart -->
+        <div class="card">
+            <h2>📈 Historik</h2>
+            <div class="chart-controls">
+                <label>Visa:</label>
+                <select id="historyRange" onchange="loadHistory()">
+                    <option value="1">Senaste timmen</option>
+                    <option value="6">6 timmar</option>
+                    <option value="24" selected>24 timmar</option>
+                    <option value="72">3 dagar</option>
+                    <option value="168">7 dagar</option>
+                    <option value="custom">Anpassat...</option>
+                </select>
+                <div id="customDateRange" style="display:none;">
+                    <input type="date" id="dateFrom">
+                    <span>till</span>
+                    <input type="date" id="dateTo">
+                    <button onclick="loadHistory()">Hämta</button>
+                </div>
+                <label style="margin-left:15px;">Visa:</label>
+                <select id="chartDataset" onchange="updateChartVisibility()">
+                    <option value="all">Alla</option>
+                    <option value="temps">Temperaturer</option>
+                    <option value="cop">COP & Effekt</option>
+                </select>
+            </div>
+            <div class="chart-container">
+                <canvas id="historyChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Energy Statistics -->
+        <div class="card">
+            <h2>⚡ Elförbrukning</h2>
+            <div class="stats" style="grid-template-columns: repeat(4, 1fr);">
+                <div class="stat-item">
+                    <div class="stat-value" id="energyToday">--</div>
+                    <div class="stat-label">Idag (kWh)</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="energy24h">--</div>
+                    <div class="stat-label">24h (kWh)</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="energy7d">--</div>
+                    <div class="stat-label">7 dagar (kWh)</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="energyTotal">--</div>
+                    <div class="stat-label">Totalt (kWh)</div>
+                </div>
+            </div>
+            <div class="chart-container" style="height:200px;margin-top:15px;">
+                <canvas id="energyChart"></canvas>
+            </div>
+        </div>
+
+        <div class="update-info">
+            Live-data var 10s | Historik från molnet | Senast: <span id="lastUpdate">--</span>
+            <br><span id="dbStatus" style="color:#666">Moln: kontrollerar...</span>
+        </div>
+    </div>
+
+    <div id="message" class="message"></div>
+
+    <script>
+        let sessionStart = Date.now();
+        let totalEnergy = 0;
+        let totalHeat = 0;
+        let copReadings = [];
+        let silentMode = false;
+        let pumpPower = true;
+        let chart = null;
+        let energyChart = null;
+        let curveChart = null;
+
+        function showMessage(text, isError = false) {
+            const msg = document.getElementById('message');
+            msg.textContent = text;
+            msg.className = 'message show' + (isError ? ' error' : '');
+            setTimeout(() => msg.className = 'message', 3000);
+        }
+
+        function calculateCOP(data) {
+            const powerIn = parseFloat(data.T39) || 0;
+            const flowTemp = parseFloat(data.T02) || 0;
+            const returnTemp = parseFloat(data.T01) || 0;
+            const deltaT = flowTemp - returnTemp;
+            // D12 is flow rate in m³/h, convert to l/min: m³/h * 1000 / 60 = l/min * 16.67
+            const flowM3h = parseFloat(data.D12) || 0;
+            const flowLmin = flowM3h * 1000 / 60;  // Convert m³/h to l/min
+            // Heat power: Q = flow (l/min) * deltaT (°C) * 4.186 (kJ/kg·K) / 60 (s/min) = kW
+            const heatPower = (flowLmin * deltaT * 4.186) / 60;
+            let cop = 0;
+            if (powerIn > 0.1) cop = heatPower / powerIn;
+            return { cop, powerIn, heatPower, deltaT, flowLmin };
+        }
+
+        function initChart() {
+            const ctx = document.getElementById('historyChart').getContext('2d');
+            chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    datasets: [
+                        { label: 'Utgående', data: [], borderColor: '#ef5350', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+                        { label: 'Ingående', data: [], borderColor: '#ff7043', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+                        { label: 'Utomhus', data: [], borderColor: '#64b5f6', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+                        { label: 'Tank', data: [], borderColor: '#ce93d8', borderWidth: 1.5, pointRadius: 0, tension: 0.3 },
+                        { label: 'COP', data: [], borderColor: '#4caf50', borderWidth: 2, pointRadius: 0, tension: 0.3, yAxisID: 'cop' },
+                        { label: 'El kW', data: [], borderColor: '#ffca28', borderWidth: 1.5, pointRadius: 0, tension: 0.3, yAxisID: 'power' },
+                        {
+                            label: '🪵 Vedeldning',
+                            data: [],
+                            borderColor: '#8d6e63',
+                            backgroundColor: 'rgba(141, 110, 99, 0.3)',
+                            borderWidth: 0,
+                            pointRadius: 0,
+                            fill: true,
+                            tension: 0.3
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { intersect: false, mode: 'index' },
+                    plugins: {
+                        legend: { labels: { color: '#90caf9', boxWidth: 12, font: { size: 10 } } },
+                        tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': ' + (ctx.parsed.y?.toFixed(1) || '--') } }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            reverse: true,
+                            time: {
+                                displayFormats: {
+                                    hour: 'HH:mm',
+                                    day: 'dd MMM'
+                                }
+                            },
+                            ticks: {
+                                color: '#666',
+                                maxTicksLimit: 12,
+                                callback: function(value, index, ticks) {
+                                    const date = new Date(value);
+                                    const hours = date.getHours();
+                                    // Show date at midnight or first tick of a new day
+                                    if (hours === 0 || index === 0) {
+                                        return date.toLocaleDateString('sv-SE', { day: 'numeric', month: 'short' }) + ' ' + date.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+                                    }
+                                    return date.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+                                }
+                            },
+                            grid: {
+                                color: function(context) {
+                                    // Darker line at midnight
+                                    if (context.tick && new Date(context.tick.value).getHours() === 0) {
+                                        return 'rgba(255,255,255,0.2)';
+                                    }
+                                    return 'rgba(255,255,255,0.05)';
+                                }
+                            }
+                        },
+                        y: {
+                            position: 'left',
+                            ticks: { color: '#666' },
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            title: { display: true, text: '°C', color: '#666' }
+                        },
+                        cop: {
+                            position: 'right',
+                            ticks: { color: '#4caf50' },
+                            grid: { display: false },
+                            title: { display: true, text: 'COP', color: '#4caf50' },
+                            min: 0, max: 8
+                        },
+                        power: {
+                            position: 'right',
+                            ticks: { color: '#ffca28' },
+                            grid: { display: false },
+                            title: { display: true, text: 'kW', color: '#ffca28' },
+                            min: 0
+                        }
+                    }
+                }
+            });
+        }
+
+        async function loadHistory() {
+            const range = document.getElementById('historyRange').value;
+            const customDiv = document.getElementById('customDateRange');
+
+            if (range === 'custom') {
+                customDiv.style.display = 'flex';
+                const from = document.getElementById('dateFrom').value;
+                const to = document.getElementById('dateTo').value;
+                if (!from || !to) return;
+            } else {
+                customDiv.style.display = 'none';
+            }
+
+            let url = '/api/history?hours=' + range;
+
+            if (range === 'custom') {
+                const from = document.getElementById('dateFrom').value;
+                const to = document.getElementById('dateTo').value;
+                url = '/api/history?from=' + from + '&to=' + to;
+            }
+
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+
+                if (data.readings && data.readings.length > 0) {
+                    const source = data.source === 'cloud' ? 'Moln' : 'Databas';
+
+                    // Detect wood heating periods (tank temp > flow temp)
+                    let woodHeatingPeriods = [];
+                    let woodHeatingHours = 0;
+                    let woodHeatingSessions = 0;
+                    let prevWoodHeatingInWindow = null;  // Track state only within 72h window
+
+                    // Use all available data for stats (72h from cloud)
+                    const now = new Date();
+                    const last72h = new Date(now - 72 * 60 * 60 * 1000);
+
+                    const WOOD_THRESHOLD = 7;  // Tank must be 7°C warmer than flow
+                    data.readings.forEach(r => {
+                        const tankTemp = r.t06;
+                        const flowTemp = r.t02_flow;
+                        const timestamp = new Date(r.timestamp);
+                        // Wood heating detected when tank is significantly warmer than flow
+                        const isWoodHeating = tankTemp !== null && flowTemp !== null && tankTemp > flowTemp + WOOD_THRESHOLD;
+
+                        // Always add to chart visualization
+                        if (isWoodHeating) {
+                            woodHeatingPeriods.push({x: timestamp, y: tankTemp});
+                        } else {
+                            woodHeatingPeriods.push({x: timestamp, y: null});
+                        }
+
+                        // Only count stats for last 72h
+                        if (timestamp >= last72h) {
+                            if (isWoodHeating) {
+                                woodHeatingHours++;
+                                // Count new session if transitioning from non-heating to heating
+                                // (only within the 72h window)
+                                if (prevWoodHeatingInWindow === false) {
+                                    woodHeatingSessions++;
+                                } else if (prevWoodHeatingInWindow === null) {
+                                    // First reading in window that is wood heating = first session
+                                    woodHeatingSessions++;
+                                }
+                            }
+                            prevWoodHeatingInWindow = isWoodHeating;
+                        }
+                    });
+
+                    // Note: Wood stats display is updated by loadWoodStats() which always uses 72h
+                    document.getElementById('dbStatus').textContent = source + ': ' + data.readings.length + ' mätpunkter';
+
+                    // Filter out null values for cleaner charts
+                    chart.data.datasets[0].data = data.readings
+                        .filter(r => r.t02_flow !== null)
+                        .map(r => ({x: new Date(r.timestamp), y: r.t02_flow}));
+                    chart.data.datasets[1].data = data.readings
+                        .filter(r => r.t01_return !== null)
+                        .map(r => ({x: new Date(r.timestamp), y: r.t01_return}));
+                    chart.data.datasets[2].data = data.readings
+                        .filter(r => r.t04_outdoor !== null)
+                        .map(r => ({x: new Date(r.timestamp), y: r.t04_outdoor}));
+                    chart.data.datasets[3].data = data.readings
+                        .filter(r => r.t06 !== null)
+                        .map(r => ({x: new Date(r.timestamp), y: r.t06}));
+                    chart.data.datasets[4].data = data.readings
+                        .filter(r => r.cop_calculated !== null)
+                        .map(r => ({x: new Date(r.timestamp), y: r.cop_calculated}));
+                    chart.data.datasets[5].data = data.readings
+                        .filter(r => r.t39_power_kw !== null)
+                        .map(r => ({x: new Date(r.timestamp), y: r.t39_power_kw}));
+
+                    // Wood heating visualization - show as filled area where tank > flow
+                    chart.data.datasets[6].data = woodHeatingPeriods;
+
+                    chart.update();
+                } else {
+                    document.getElementById('dbStatus').textContent = 'Moln: ingen historik tillgänglig';
+                }
+            } catch (e) {
+                console.error('History fetch error:', e);
+                document.getElementById('dbStatus').textContent = 'Moln: fel vid hämtning';
+            }
+        }
+
+        function updateChartVisibility() {
+            const mode = document.getElementById('chartDataset').value;
+            if (mode === 'temps') {
+                chart.data.datasets[0].hidden = false;  // Utgående
+                chart.data.datasets[1].hidden = false;  // Ingående
+                chart.data.datasets[2].hidden = false;  // Utomhus
+                chart.data.datasets[3].hidden = false;  // Tank
+                chart.data.datasets[4].hidden = true;   // COP
+                chart.data.datasets[5].hidden = true;   // El kW
+                chart.data.datasets[6].hidden = false;  // Vedeldning
+            } else if (mode === 'cop') {
+                chart.data.datasets[0].hidden = true;
+                chart.data.datasets[1].hidden = true;
+                chart.data.datasets[2].hidden = true;
+                chart.data.datasets[3].hidden = true;
+                chart.data.datasets[4].hidden = false;
+                chart.data.datasets[5].hidden = false;
+                chart.data.datasets[6].hidden = true;
+            } else {
+                chart.data.datasets.forEach(ds => ds.hidden = false);
+            }
+            chart.update();
+        }
+
+        async function fetchStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+
+                // Temperatures
+                const t04 = parseFloat(data.T04) || 0;
+                const t02 = parseFloat(data.T02) || 0;
+                const t01 = parseFloat(data.T01) || 0;
+                const t11 = parseFloat(data.T11) || 0;
+                const t06 = parseFloat(data.T06) || 0;
+                const t03 = parseFloat(data.T03) || 0;
+                const t39 = parseFloat(data.T39) || 0;
+                const t33 = parseFloat(data.T33) || 0;
+                const heatTarget = parseFloat(data['M1 Heating Target']) || 0;
+
+                document.getElementById('tempOutdoor').textContent = t04.toFixed(1) + '°';
+                document.getElementById('tempFlow').textContent = t02.toFixed(1) + '°';
+                document.getElementById('tempIngåenden').textContent = t01.toFixed(1) + '°';
+                document.getElementById('tempTank').textContent = t06.toFixed(1) + '°';
+                document.getElementById('tempComp').textContent = (parseFloat(data.T12) || 0).toFixed(1) + '°';
+                document.getElementById('tempEvap').textContent = t03.toFixed(1) + '°';
+
+                // Settings
+                document.getElementById('inputCurveOffset').value = data.compensate_offset;
+                document.getElementById('inputCurveSlope').value = data.compensate_slope;
+                document.getElementById('inputHwTarget').value = data.R01;
+
+                // Driftdata - interpolate target from curve points
+                const outdoorTemps = [-20, -10, 0, 5, 10, 15, 20];
+                const curveTemps = [
+                    parseFloat(data['CP1-1']) || 0,
+                    parseFloat(data['CP1-2']) || 0,
+                    parseFloat(data['CP1-3']) || 0,
+                    parseFloat(data['CP1-4']) || 0,
+                    parseFloat(data['CP1-5']) || 0,
+                    parseFloat(data['CP1-6']) || 0,
+                    parseFloat(data['CP1-7']) || 0
+                ];
+
+                // Interpolate target temp based on current outdoor temp
+                let calcTarget = curveTemps[0];
+                for (let i = 0; i < outdoorTemps.length - 1; i++) {
+                    if (t04 >= outdoorTemps[i] && t04 <= outdoorTemps[i + 1]) {
+                        const ratio = (t04 - outdoorTemps[i]) / (outdoorTemps[i + 1] - outdoorTemps[i]);
+                        calcTarget = curveTemps[i] + ratio * (curveTemps[i + 1] - curveTemps[i]);
+                        break;
+                    } else if (t04 < outdoorTemps[0]) {
+                        calcTarget = curveTemps[0];
+                    } else if (t04 > outdoorTemps[outdoorTemps.length - 1]) {
+                        calcTarget = curveTemps[curveTemps.length - 1];
+                    }
+                }
+
+                document.getElementById('calcTarget').textContent = calcTarget.toFixed(1) + '°C';
+
+                // Update curve chart
+                updateCurveChart(data);
+
+                // COP
+                const copData = calculateCOP(data);
+                document.getElementById('copValue').textContent = copData.cop > 0 ? copData.cop.toFixed(2) : '--';
+                document.getElementById('powerIn').textContent = copData.powerIn.toFixed(2);
+                document.getElementById('powerOut').textContent = copData.heatPower > 0 ? copData.heatPower.toFixed(1) : '--';
+                document.getElementById('deltaT').textContent = copData.deltaT.toFixed(1);
+                document.getElementById('compFreq').textContent = t33.toFixed(0);
+
+                // Pressure and flow
+                document.getElementById('pressure1').textContent = (data.T35 || '--') + ' bar';
+                document.getElementById('pressure2').textContent = (data.T36 || '--') + ' bar';
+                document.getElementById('flowRate').textContent = (data.D12 || '--');
+                document.getElementById('compFreqStat').textContent = t33.toFixed(0) + '%';
+
+                // Pump active status
+                const pumpActiveEl = document.getElementById('pumpActive');
+                if (t33 > 5 || t39 > 0.2) {
+                    pumpActiveEl.textContent = 'AKTIV';
+                    pumpActiveEl.style.color = '#4caf50';
+                } else {
+                    pumpActiveEl.textContent = 'VILAR';
+                    pumpActiveEl.style.color = '#ff9800';
+                }
+
+                // Pump status - detect if pump is stopped due to high tank temp (wood heating)
+                const pumpStatus = document.getElementById('pumpStatus');
+                const statusTitle = document.getElementById('pumpStatusTitle');
+                const statusDesc = document.getElementById('pumpStatusDesc');
+                const woodBadge = document.getElementById('woodBadge');
+                const compBadge = document.getElementById('compBadge');
+
+                const compRunning = t39 > 0.2 || t33 > 10;
+                const tankAboveTarget = t06 > heatTarget || t01 > heatTarget;
+
+                if (!compRunning && tankAboveTarget) {
+                    // Wood heating detected - tank temp above target
+                    pumpStatus.className = 'pump-status wood';
+                    statusTitle.textContent = '🪵 Vedeldning detekterad';
+                    statusDesc.textContent = 'Tank: ' + t06.toFixed(1) + '°C > Börvärde: ' + heatTarget.toFixed(0) + '°C - Pumpen vilar';
+                    woodBadge.style.display = 'inline-block';
+                    compBadge.style.display = 'none';
+                } else if (compRunning) {
+                    pumpStatus.className = 'pump-status running';
+                    statusTitle.textContent = '🟢 Värmepump aktiv';
+                    statusDesc.textContent = 'Kompressor: ' + t33.toFixed(0) + '% | Effekt: ' + t39.toFixed(2) + ' kW';
+                    woodBadge.style.display = 'none';
+                    compBadge.style.display = 'inline-block';
+                } else {
+                    pumpStatus.className = 'pump-status stopped';
+                    statusTitle.textContent = '🔴 Värmepump stannad';
+                    statusDesc.textContent = 'Kompressorn är av';
+                    woodBadge.style.display = 'none';
+                    compBadge.style.display = 'none';
+                }
+
+                // Mode badge
+                const modeBadge = document.getElementById('modeBadge');
+                const mode = data.Mode;
+                modeBadge.textContent = mode === '1' ? 'VÄRME' : mode === '2' ? 'KYLA' : mode === '3' ? 'VV' : 'LÄGE ' + mode;
+                modeBadge.className = 'badge ' + (mode === '1' ? 'heating' : mode === '3' ? 'hotwater' : 'idle');
+
+                // Silent mode
+                silentMode = data.hanControl && data.hanControl.includes('1');
+                document.getElementById('silentBtn').textContent = silentMode ? 'PÅ' : 'AV';
+                document.getElementById('silentBtn').className = 'toggle ' + (silentMode ? 'active' : 'inactive');
+                document.getElementById('silentBadge').style.display = silentMode ? 'inline-block' : 'none';
+
+                // Power state
+                pumpPower = data.Power === '1';
+                document.getElementById('powerBtn').textContent = pumpPower ? 'PÅ' : 'AV';
+                document.getElementById('powerBtn').className = 'toggle ' + (pumpPower ? 'active' : 'inactive');
+
+                // Advanced controls - populate with current values
+                if (data['M1 Heating Target']) document.getElementById('inputM1HeatTarget').value = data['M1 Heating Target'];
+                if (data['M1 Max. Power']) document.getElementById('inputMaxPower').value = data['M1 Max. Power'];
+                if (data['CP1-1']) document.getElementById('inputCP1_1').value = data['CP1-1'];
+                if (data['CP1-2']) document.getElementById('inputCP1_2').value = data['CP1-2'];
+                if (data['CP1-3']) document.getElementById('inputCP1_3').value = data['CP1-3'];
+                if (data['Zone 2 Curve Offset']) document.getElementById('inputZ2Offset').value = data['Zone 2 Curve Offset'];
+                if (data['Zone 2 Cure Slope']) document.getElementById('inputZ2Slope').value = data['Zone 2 Cure Slope'];
+                if (data['SG Status']) document.getElementById('inputSG').value = data['SG Status'];
+
+                document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('sv-SE');
+
+            } catch (e) {
+                console.error('Fetch error:', e);
+            }
+        }
+
+        const CONTROL_PASSWORD = 'Mb29661';  // Same as login password
+        let passwordVerified = false;
+        let passwordTimeout = null;
+
+        function verifyPassword() {
+            const pwd = prompt('⚠️ VARNING: Du är på väg att ändra pumpen.\\n\\nAnge lösenord för att bekräfta:');
+            if (pwd === CONTROL_PASSWORD) {
+                passwordVerified = true;
+                // Password valid for 5 minutes
+                if (passwordTimeout) clearTimeout(passwordTimeout);
+                passwordTimeout = setTimeout(() => { passwordVerified = false; }, 5 * 60 * 1000);
+                return true;
+            } else if (pwd !== null) {
+                showMessage('Fel lösenord!', true);
+            }
+            return false;
+        }
+
+        async function safeSetParam(code, value) {
+            if (!passwordVerified && !verifyPassword()) return;
+            await setParam(code, value);
+        }
+
+        function safeToggleSilent() {
+            if (!passwordVerified && !verifyPassword()) return;
+            setParam('hanControl', silentMode ? '0000000000000000' : '0000000000000010');
+        }
+
+        function safeTogglePower() {
+            if (!passwordVerified && !verifyPassword()) return;
+            const newState = pumpPower ? '0' : '1';
+            if (!pumpPower || confirm('Är du säker på att du vill STÄNGA AV pumpen?')) {
+                setParam('Power', newState);
+            }
+        }
+
+        async function setParam(code, value) {
+            try {
+                const res = await fetch('/api/control', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({code, value: String(value)})
+                });
+                const data = await res.json();
+                if (data.success) {
+                    showMessage('Sparat: ' + code + ' = ' + value);
+                    fetchStatus();
+                } else {
+                    showMessage('Fel', true);
+                }
+            } catch (e) {
+                showMessage('Anslutningsfel', true);
+            }
+        }
+
+        function toggleSilent() {
+            setParam('hanControl', silentMode ? '0000000000000000' : '0000000000000010');
+        }
+
+        function toggleControls() {
+            const panel = document.getElementById('controlsPanel');
+            const arrow = document.getElementById('controlsArrow');
+            if (panel.style.display === 'none') {
+                panel.style.display = 'block';
+                arrow.textContent = '▼';
+            } else {
+                panel.style.display = 'none';
+                arrow.textContent = '▶';
+            }
+        }
+
+        function initCurveChart() {
+            const ctx = document.getElementById('curveChart').getContext('2d');
+            curveChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    datasets: [
+                        {
+                            label: 'Värmekurva',
+                            data: [],
+                            borderColor: '#ff7043',
+                            backgroundColor: 'rgba(255, 112, 67, 0.1)',
+                            borderWidth: 2,
+                            pointRadius: 4,
+                            pointBackgroundColor: '#ff7043',
+                            fill: true,
+                            tension: 0.3
+                        },
+                        {
+                            label: 'Nu',
+                            data: [],
+                            borderColor: '#4caf50',
+                            borderWidth: 0,
+                            pointRadius: 8,
+                            pointBackgroundColor: '#4caf50',
+                            pointStyle: 'circle'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: ctx => 'Utgående: ' + ctx.parsed.y + '°C vid ' + ctx.parsed.x + '°C ute'
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: { display: true, text: 'Utomhustemp °C', color: '#666', font: { size: 10 } },
+                            ticks: { color: '#666' },
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            reverse: true
+                        },
+                        y: {
+                            title: { display: true, text: 'Utgående °C', color: '#666', font: { size: 10 } },
+                            ticks: { color: '#666' },
+                            grid: { color: 'rgba(255,255,255,0.05)' }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateCurveChart(data) {
+            // CP1-1 to CP1-7 define curve points at outdoor temps (typically -20 to +20)
+            // Standard outdoor temp points: -20, -10, 0, 5, 10, 15, 20
+            const outdoorTemps = [-20, -10, 0, 5, 10, 15, 20];
+            const curvePoints = [];
+
+            for (let i = 1; i <= 7; i++) {
+                const val = parseFloat(data['CP1-' + i]);
+                if (!isNaN(val) && val > 0) {
+                    curvePoints.push({ x: outdoorTemps[i - 1], y: val });
+                }
+            }
+
+            if (curvePoints.length > 0) {
+                curveChart.data.datasets[0].data = curvePoints;
+
+                // Add current position marker
+                const currentOutdoor = parseFloat(data.T04) || 0;
+                const currentFlow = parseFloat(data.T02) || 0;
+                curveChart.data.datasets[1].data = [{ x: currentOutdoor, y: currentFlow }];
+
+                curveChart.update();
+
+                // Update curve info
+                const offset = data.compensate_offset || '--';
+                const slope = data.compensate_slope || '--';
+                document.getElementById('curveInfo').textContent =
+                    'Offset: ' + offset + '°C | Lutning: ' + slope + ' | Aktuell: ' + currentFlow.toFixed(1) + '°C vid ' + currentOutdoor.toFixed(1) + '°C ute';
+            }
+        }
+
+        function initEnergyChart() {
+            const ctx = document.getElementById('energyChart').getContext('2d');
+            energyChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    datasets: [{
+                        label: 'kWh',
+                        data: [],
+                        backgroundColor: 'rgba(255, 193, 7, 0.7)',
+                        borderColor: '#ffc107',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            reverse: true,
+                            time: { unit: 'day', displayFormats: { day: 'dd MMM', hour: 'HH:mm' } },
+                            ticks: { color: '#666' },
+                            grid: { color: 'rgba(255,255,255,0.05)' }
+                        },
+                        y: {
+                            ticks: { color: '#666' },
+                            grid: { color: 'rgba(255,255,255,0.05)' },
+                            title: { display: true, text: 'kWh', color: '#666' }
+                        }
+                    }
+                }
+            });
+        }
+
+        async function loadEnergy() {
+            try {
+                const res = await fetch('/api/energy?hours=72');
+                const data = await res.json();
+
+                // Update stats regardless of readings
+                document.getElementById('energyToday').textContent = (data.today_kwh || 0).toFixed(1);
+                document.getElementById('energy24h').textContent = (data.last_24h_kwh || 0).toFixed(1);
+                document.getElementById('energy7d').textContent = (data.total_kwh || 0).toFixed(1);
+                document.getElementById('energyTotal').textContent = (data.total_kwh || 0).toFixed(1);
+
+                if (data.readings && data.readings.length > 0) {
+                    // Aggregate by day
+                    const dailyData = {};
+                    data.readings.forEach(r => {
+                        const day = r.timestamp.split('T')[0];
+                        if (!dailyData[day]) dailyData[day] = 0;
+                        dailyData[day] += r.kwh;
+                    });
+
+                    const chartData = Object.entries(dailyData)
+                        .map(([day, kwh]) => ({
+                            x: new Date(day),
+                            y: parseFloat(kwh.toFixed(2))
+                        }))
+                        .sort((a, b) => a.x - b.x);
+
+                    energyChart.data.datasets[0].data = chartData;
+                    energyChart.update();
+                }
+            } catch (e) {
+                console.error('Energy fetch error:', e);
+            }
+        }
+
+        // Load wood heating stats (72h - max available from cloud)
+        async function loadWoodStats() {
+            try {
+                const res = await fetch('/api/history?hours=72');
+                const data = await res.json();
+                if (data.readings && data.readings.length > 0) {
+                    let woodHeatingHours = 0;
+                    let woodHeatingSessions = 0;
+                    let prevWoodHeating = null;
+
+                    const WOOD_THRESHOLD = 7;  // Tank must be 7°C warmer than flow
+                    data.readings.forEach(r => {
+                        const tankTemp = r.t06;
+                        const flowTemp = r.t02_flow;
+                        const isWoodHeating = tankTemp !== null && flowTemp !== null && tankTemp > flowTemp + WOOD_THRESHOLD;
+
+                        if (isWoodHeating) {
+                            woodHeatingHours++;
+                            if (prevWoodHeating === false || prevWoodHeating === null) {
+                                woodHeatingSessions++;
+                            }
+                        }
+                        prevWoodHeating = isWoodHeating;
+                    });
+
+                    document.getElementById('woodHours').textContent = woodHeatingHours;
+                    document.getElementById('woodSessions').textContent = woodHeatingSessions;
+                }
+            } catch (e) {
+                console.error('Wood stats error:', e);
+            }
+        }
+
+        // Initialize
+        initChart();
+        initCurveChart();
+        initEnergyChart();
+        fetchStatus();
+        loadHistory();
+        loadEnergy();
+        loadWoodStats();
+        setInterval(fetchStatus, 10000);
+        setInterval(loadHistory, 60000); // Refresh history every minute
+        setInterval(loadEnergy, 300000); // Refresh energy every 5 minutes
+        setInterval(loadWoodStats, 300000); // Refresh wood stats every 5 minutes
+    </script>
+</body>
+</html>
+"""
+
+def get_client():
+    client = PerifalClient(USERNAME, PASSWORD)
+    client.login()
+    return client
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/status')
+def api_status():
+    client = get_client()
+    params = client.get_all_parameters(DEVICE_CODE, ALL_PARAMS)
+    return jsonify(params)
+
+@app.route('/api/history')
+def api_history():
+    """Fetch history from cloud API (no local logging needed)"""
+    hours = request.args.get('hours', 24, type=int)
+    date_from = request.args.get('from')
+    date_to = request.args.get('to')
+
+    try:
+        client = get_client()
+
+        # Calculate time range
+        if date_from and date_to:
+            start_time = date_from + " 00:00:00"
+            end_time = date_to + " 23:59:59"
+        else:
+            end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            start_time = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+
+        # Determine frequency based on time range
+        # Cloud API supports: "day" (hourly points), "week", "month", "year"
+        if hours <= 72:
+            frequency = "day"
+        elif hours <= 168:
+            frequency = "week"
+        else:
+            frequency = "month"
+
+        # Fetch all data series from cloud
+        # 2046 = Outlet/Flow temp (T02)
+        # 2047 = Tank temp (T06)
+        # 2048 = Outdoor temp (T04)
+        # 2054 = Power In (kW)
+        flow_data = client.get_history(DEVICE_CODE, "2046", start_time, end_time, frequency)
+        tank_data = client.get_history(DEVICE_CODE, "2047", start_time, end_time, frequency)
+        outdoor_data = client.get_history(DEVICE_CODE, "2048", start_time, end_time, frequency)
+        power_data = client.get_history(DEVICE_CODE, "2054", start_time, end_time, frequency)
+
+        # Combine data into unified format
+        readings = []
+
+        # Get value lists
+        flow_values = flow_data.get('valueList', []) if isinstance(flow_data, dict) else []
+        tank_values = tank_data.get('valueList', []) if isinstance(tank_data, dict) else []
+        outdoor_values = outdoor_data.get('valueList', []) if isinstance(outdoor_data, dict) else []
+        power_values = power_data.get('valueList', []) if isinstance(power_data, dict) else []
+
+        # Create lookup dicts by datetime
+        flow_by_time = {v['dateTime']: float(v['addressValue']) for v in flow_values}
+        tank_by_time = {v['dateTime']: float(v['addressValue']) for v in tank_values}
+        outdoor_by_time = {v['dateTime']: float(v['addressValue']) for v in outdoor_values}
+        power_by_time = {v['dateTime']: float(v['addressValue']) for v in power_values}
+
+        # Get all unique timestamps and sort chronologically (oldest first)
+        all_times = set(flow_by_time.keys()) | set(tank_by_time.keys()) | set(outdoor_by_time.keys()) | set(power_by_time.keys())
+
+        for dt in sorted(all_times):
+            # Parse datetime - cloud format is "YYYY-MM-DD HH" (hourly)
+            try:
+                timestamp = datetime.strptime(dt, '%Y-%m-%d %H')
+            except:
+                continue
+
+            flow_temp = flow_by_time.get(dt)
+            power_kw = power_by_time.get(dt)
+
+            # Calculate COP if we have flow temp and power
+            # Note: We don't have return temp from cloud, so we estimate deltaT as ~2°C
+            cop = None
+            if flow_temp and power_kw and power_kw > 0.1:
+                # Estimate: assume deltaT ~2°C and flow ~50 l/min
+                estimated_heat = (50 * 2 * 4.186) / 60  # ~7 kW at full flow
+                cop = estimated_heat / power_kw if power_kw > 0 else None
+
+            readings.append({
+                'timestamp': timestamp.isoformat(),
+                't02_flow': flow_temp,
+                't06': tank_by_time.get(dt),
+                't04_outdoor': outdoor_by_time.get(dt),
+                't01_return': None,  # Not available from cloud
+                'cop_calculated': cop,
+                't39_power_kw': power_kw
+            })
+
+        return jsonify({
+            'readings': readings,
+            'source': 'cloud',
+            'hours_requested': hours,
+            'start_time': start_time,
+            'end_time': end_time,
+            'frequency': frequency,
+            'flow_title': flow_data.get('title') if isinstance(flow_data, dict) else None,
+            'tank_title': tank_data.get('title') if isinstance(tank_data, dict) else None,
+            'outdoor_title': outdoor_data.get('title') if isinstance(outdoor_data, dict) else None
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'readings': [], 'error': str(e), 'traceback': traceback.format_exc(), 'source': 'cloud'})
+
+@app.route('/api/energy')
+def api_energy():
+    """Fetch energy consumption history from cloud"""
+    hours = request.args.get('hours', 168, type=int)  # Default 7 days
+
+    try:
+        client = get_client()
+
+        end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        start_time = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
+
+        # Always use "day" frequency for consistent hourly data format
+        frequency = "day"
+
+        # 2054 = Power In (Total)
+        power_data = client.get_history(DEVICE_CODE, "2054", start_time, end_time, frequency)
+
+        readings = []
+        total_kwh = 0
+        today_kwh = 0
+        last_24h_kwh = 0
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        now = datetime.now()
+
+        if isinstance(power_data, dict):
+            values = power_data.get('valueList', [])
+            for v in values:
+                dt_str = v.get('dateTime', '')
+                kwh = float(v.get('addressValue', 0) or 0)
+                total_kwh += kwh
+
+                # Parse date - try multiple formats
+                dt = None
+                for fmt in ['%Y-%m-%d %H', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M']:
+                    try:
+                        dt = datetime.strptime(dt_str, fmt)
+                        break
+                    except:
+                        continue
+
+                if dt:
+                    readings.append({
+                        'timestamp': dt.isoformat(),
+                        'kwh': kwh
+                    })
+
+                    # Today's consumption
+                    if dt.date() == now.date():
+                        today_kwh += kwh
+
+                    # Last 24 hours
+                    if dt >= now - timedelta(hours=24):
+                        last_24h_kwh += kwh
+
+        return jsonify({
+            'readings': readings,
+            'total_kwh': round(total_kwh, 2),
+            'today_kwh': round(today_kwh, 2),
+            'last_24h_kwh': round(last_24h_kwh, 2),
+            'hours': hours,
+            'points': len(readings)
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'readings': [], 'error': str(e), 'traceback': traceback.format_exc()})
+
+@app.route('/api/events')
+def api_events():
+    hours = request.args.get('hours', 24, type=int)
+
+    try:
+        conn = get_db()
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+
+        c.execute('''
+            SELECT * FROM events
+            WHERE timestamp > datetime('now', '-' || ? || ' hours')
+            ORDER BY timestamp DESC
+            LIMIT 100
+        ''', (hours,))
+
+        rows = c.fetchall()
+        conn.close()
+
+        return jsonify({'events': [dict(row) for row in rows]})
+
+    except Exception as e:
+        return jsonify({'events': [], 'error': str(e)})
+
+@app.route('/api/control', methods=['POST'])
+def api_control():
+    data = request.json
+    code = data.get('code')
+    value = data.get('value')
+
+    if not code or value is None:
+        return jsonify({'success': False, 'error': 'Missing code or value'})
+
+    client = get_client()
+    success = client.control(DEVICE_CODE, code, value)
+    return jsonify({'success': success})
+
+@app.route('/api/db-stats')
+def api_db_stats():
+    """Get database statistics"""
+    stats = get_db_stats()
+    return jsonify(stats)
+
+@app.route('/api/local-history')
+def api_local_history():
+    """Get history from local database"""
+    hours = request.args.get('hours', 168, type=int)
+    readings = get_local_history(hours)
+    stats = get_db_stats()
+    return jsonify({
+        'readings': readings,
+        'source': 'local_db',
+        'db_stats': stats
+    })
+
+# Initialize on module load (for gunicorn)
+init_db()
+start_logger()
+
+if __name__ == '__main__':
+    db_type = "PostgreSQL" if USE_POSTGRES else "SQLite"
+    stats = get_db_stats()
+
+    print("\n" + "="*50)
+    print("  Perifal LV-418 Advanced Dashboard")
+    print("  http://localhost:5051")
+    print("")
+    print(f"  Databas: {db_type}")
+    print(f"  Lagrade mätpunkter: {stats['count']}")
+    print("  Loggning var 10:e minut aktiverad")
+    print("="*50 + "\n")
+
+    port = int(os.getenv("PORT", 5051))
+    app.run(host='0.0.0.0', port=port, debug=False)
