@@ -2766,10 +2766,9 @@ def api_history():
             start_time = (datetime.now() - timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')
 
         # Determine frequency based on time range
-        if hours <= 72:
+        # Note: "week" and "month" don't work well with Warmlink API, use "day" for up to 7 days
+        if hours <= 168:
             frequency = "day"
-        elif hours <= 168:
-            frequency = "week"
         else:
             frequency = "month"
 
