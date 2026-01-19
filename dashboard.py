@@ -2977,6 +2977,24 @@ def api_local_history():
 # Initialize on module load (for gunicorn)
 init_db()
 ensure_admin_exists()
+
+# Auto-import history if database is nearly empty (works with gunicorn too)
+try:
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT COUNT(*) FROM readings_raw')
+    raw_count = cur.fetchone()[0]
+    conn.close()
+
+    if raw_count < 100:
+        db_type = "PostgreSQL" if USE_POSTGRES else "SQLite (EPHEMERAL!)"
+        print(f"\n*** Database ({db_type}) har bara {raw_count} rader ***", flush=True)
+        print("Importerar 72h historik från Warmlink cloud...", flush=True)
+        imported = import_cloud_history(72)
+        print(f"Importerade {imported} datapunkter\n", flush=True)
+except Exception as e:
+    print(f"Could not check/import history at startup: {e}", flush=True)
+
 start_logger()
 
 if __name__ == '__main__':
