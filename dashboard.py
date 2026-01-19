@@ -2725,13 +2725,15 @@ def api_history():
                 t01 = r.get('T01')
                 t39 = r.get('T39')
 
-                # Only calculate COP if we have ALL required values
+                # Calculate COP - use estimated flow (2 m³/h) if T39 is missing
                 cop = None
-                if t01 is not None and t02 is not None and t39 is not None and power_kw is not None:
-                    if t39 > 0 and power_kw > 0.1:
-                        delta_t = t02 - t01
-                        flow_lmin = t39 * 1000 / 60
-                        heat_power = (flow_lmin * delta_t * 4.186) / 60
+                if t01 is not None and t02 is not None and power_kw is not None and power_kw > 0.1:
+                    # Use actual T39 if available, otherwise estimate 2 m³/h (typical for LV-418)
+                    flow_m3h = t39 if (t39 is not None and t39 > 0) else 2.0
+                    delta_t = t02 - t01
+                    flow_lmin = flow_m3h * 1000 / 60
+                    heat_power = (flow_lmin * delta_t * 4.186) / 60
+                    if heat_power > 0:
                         cop = min(heat_power / power_kw, 5.0)
 
                 readings.append({
@@ -2773,10 +2775,11 @@ def api_history():
             frequency = "month"
 
         # Fetch all data series from cloud
-        flow_data = client.get_history(DEVICE_CODE, "2046", start_time, end_time, frequency)
-        tank_data = client.get_history(DEVICE_CODE, "2047", start_time, end_time, frequency)
-        outdoor_data = client.get_history(DEVICE_CODE, "2048", start_time, end_time, frequency)
-        power_data = client.get_history(DEVICE_CODE, "2054", start_time, end_time, frequency)
+        flow_data = client.get_history(DEVICE_CODE, "2046", start_time, end_time, frequency)  # T02
+        tank_data = client.get_history(DEVICE_CODE, "2047", start_time, end_time, frequency)  # T08
+        outdoor_data = client.get_history(DEVICE_CODE, "2048", start_time, end_time, frequency)  # T04
+        power_data = client.get_history(DEVICE_CODE, "2054", start_time, end_time, frequency)  # Power
+        return_data = client.get_history(DEVICE_CODE, "2049", start_time, end_time, frequency)  # T01
 
         readings = []
 
@@ -2784,13 +2787,15 @@ def api_history():
         tank_values = tank_data.get('valueList', []) if isinstance(tank_data, dict) else []
         outdoor_values = outdoor_data.get('valueList', []) if isinstance(outdoor_data, dict) else []
         power_values = power_data.get('valueList', []) if isinstance(power_data, dict) else []
+        return_values = return_data.get('valueList', []) if isinstance(return_data, dict) else []
 
         flow_by_time = {v['dateTime']: float(v['addressValue']) for v in flow_values}
         tank_by_time = {v['dateTime']: float(v['addressValue']) for v in tank_values}
         outdoor_by_time = {v['dateTime']: float(v['addressValue']) for v in outdoor_values}
         power_by_time = {v['dateTime']: float(v['addressValue']) for v in power_values}
+        return_by_time = {v['dateTime']: float(v['addressValue']) for v in return_values}
 
-        all_times = set(flow_by_time.keys()) | set(tank_by_time.keys()) | set(outdoor_by_time.keys()) | set(power_by_time.keys())
+        all_times = set(flow_by_time.keys()) | set(tank_by_time.keys()) | set(outdoor_by_time.keys()) | set(power_by_time.keys()) | set(return_by_time.keys())
 
         for dt in sorted(all_times):
             try:
@@ -2798,20 +2803,25 @@ def api_history():
             except:
                 continue
 
-            flow_temp = flow_by_time.get(dt)
+            t02 = flow_by_time.get(dt)  # Utgående temp
+            t01 = return_by_time.get(dt)  # Ingående temp
             power_kw = power_by_time.get(dt)
 
+            # Calculate COP using estimated flow (2 m³/h) since cloud doesn't have T39
             cop = None
-            if flow_temp and power_kw and power_kw > 0.1:
-                estimated_heat = (50 * 2 * 4.186) / 60
-                cop = estimated_heat / power_kw if power_kw > 0 else None
+            if t02 is not None and t01 is not None and power_kw is not None and power_kw > 0.1:
+                delta_t = t02 - t01
+                flow_lmin = 2.0 * 1000 / 60  # 2 m³/h estimated flow for LV-418
+                heat_power = (flow_lmin * delta_t * 4.186) / 60
+                if heat_power > 0:
+                    cop = min(heat_power / power_kw, 5.0)
 
             readings.append({
                 'timestamp': timestamp.isoformat(),
-                't02_flow': flow_temp,
+                't02_flow': t02,
                 't06': tank_by_time.get(dt),
                 't04_outdoor': outdoor_by_time.get(dt),
-                't01_return': None,
+                't01_return': t01,
                 'cop_calculated': cop,
                 't39_power_kw': power_kw
             })
