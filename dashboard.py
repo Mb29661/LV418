@@ -2709,48 +2709,15 @@ def api_history():
     hours = request.args.get('hours', 24, type=int)
     source = request.args.get('source', 'auto')  # auto, db, cloud
 
-    # Parameters to fetch from database
-    params = ['T01', 'T02', 'T04', 'T08', 'T39', '2054']
-
-    # Try database first (unless cloud is explicitly requested)
+    # Try readings table first (has pre-calculated COP from live logger)
     if source != 'cloud':
-        db_readings = get_history_from_db(params, hours)
+        db_readings = get_local_history(hours)
         if db_readings and len(db_readings) > 3:
-            # Convert to expected format for UI
-            readings = []
-            for r in db_readings:
-                # Get values - use None if not available (not 0)
-                power_kw = r.get('2054')
-                t02 = r.get('T02')
-                t01 = r.get('T01')
-                t39 = r.get('T39')
-
-                # Calculate COP - use estimated flow (2 m³/h) if T39 is missing
-                cop = None
-                if t01 is not None and t02 is not None and power_kw is not None and power_kw > 0.1:
-                    # Use actual T39 if available, otherwise estimate 2 m³/h (typical for LV-418)
-                    flow_m3h = t39 if (t39 is not None and t39 > 0) else 2.0
-                    delta_t = t02 - t01
-                    flow_lmin = flow_m3h * 1000 / 60
-                    heat_power = (flow_lmin * delta_t * 4.186) / 60
-                    if heat_power > 0:
-                        cop = min(heat_power / power_kw, 5.0)
-
-                readings.append({
-                    'timestamp': r['timestamp'],
-                    't02_flow': t02,
-                    't06': r.get('T08'),  # T08 is tank temp
-                    't04_outdoor': r.get('T04'),
-                    't01_return': t01,  # Will be None for cloud-imported data
-                    'cop_calculated': cop,  # Will be None if T01/T39 missing
-                    't39_power_kw': power_kw
-                })
-
             return jsonify({
-                'readings': readings,
+                'readings': db_readings,
                 'source': 'database',
                 'hours_requested': hours,
-                'count': len(readings)
+                'count': len(db_readings)
             })
 
     # Fallback to cloud API
