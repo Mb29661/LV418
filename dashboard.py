@@ -2720,6 +2720,43 @@ def api_history():
                 'count': len(db_readings)
             })
 
+        # Fallback to readings_raw with estimated COP (2 m³/h flow)
+        params = ['T01', 'T02', 'T04', 'T08', '2054']
+        raw_readings = get_history_from_db(params, hours)
+        if raw_readings and len(raw_readings) > 3:
+            readings = []
+            for r in raw_readings:
+                t01 = r.get('T01')
+                t02 = r.get('T02')
+                power_kw = r.get('2054')
+
+                # Calculate COP with estimated flow (2 m³/h for LV-418)
+                cop = None
+                if t01 is not None and t02 is not None and power_kw is not None and power_kw > 0.1:
+                    delta_t = t02 - t01
+                    flow_lmin = 2.0 * 1000 / 60  # 2 m³/h estimated
+                    heat_power = (flow_lmin * delta_t * 4.186) / 60
+                    if heat_power > 0:
+                        cop = min(heat_power / power_kw, 5.0)
+
+                readings.append({
+                    'timestamp': r['timestamp'],
+                    't02_flow': t02,
+                    't06': r.get('T08'),
+                    't04_outdoor': r.get('T04'),
+                    't01_return': t01,
+                    'cop_calculated': cop,
+                    't39_power_kw': power_kw
+                })
+
+            return jsonify({
+                'readings': readings,
+                'source': 'database_raw',
+                'hours_requested': hours,
+                'count': len(readings),
+                'note': 'COP estimated with 2 m³/h flow'
+            })
+
     # Fallback to cloud API
     try:
         client = get_client()
