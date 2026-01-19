@@ -2232,15 +2232,16 @@ HTML_TEMPLATE = """
                 document.getElementById('tempEvap').textContent = t03.toFixed(1) + '°';
 
                 // Driftdata - interpolate target from curve points
-                const outdoorTemps = [-20, -10, 0, 5, 10, 15, 20];
+                // Kurvan: -20°C, -10°C, -5°C, 0°C, 5°C, 10°C, 20°C
+                const outdoorTemps = [-20, -10, -5, 0, 5, 10, 20];
                 const curveTemps = [
-                    parseFloat(data['CP1-1']) || 0,
-                    parseFloat(data['CP1-2']) || 0,
-                    parseFloat(data['CP1-3']) || 0,
-                    parseFloat(data['CP1-4']) || 0,
-                    parseFloat(data['CP1-5']) || 0,
-                    parseFloat(data['CP1-6']) || 0,
-                    parseFloat(data['CP1-7']) || 0
+                    parseFloat(data['CP1-1']) || 53,
+                    parseFloat(data['CP1-2']) || 45,
+                    parseFloat(data['CP1-3']) || 45,
+                    parseFloat(data['CP1-4']) || 38,
+                    parseFloat(data['CP1-5']) || 35,
+                    parseFloat(data['CP1-6']) || 25,
+                    parseFloat(data['CP1-7']) || 20
                 ];
 
                 // Interpolate target temp based on current outdoor temp
